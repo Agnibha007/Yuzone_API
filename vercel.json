@@ -1,7 +1,15 @@
 {
   "functions": {
-    "api/*.py": {
+    "api/main.py": {
+      "runtime": "python3.9",
+      "maxDuration": 60,
       "includeFiles": "api/bin/**"
     }
-  }
+  },
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "/api/main.py"
+    }
+  ]
 }

@@ -1,15 +1,8 @@
 {
+  "version": 2,
   "functions": {
-    "api/main.py": {
-      "runtime": "python3.9",
-      "maxDuration": 60,
-      "includeFiles": "api/bin/**"
+    "api/*.py": {
+      "runtime": "vercel-python@0.5.0"
     }
-  },
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "/api/main.py"
-    }
-  ]
+  }
 }

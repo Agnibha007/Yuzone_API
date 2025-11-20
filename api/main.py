@@ -42,8 +42,8 @@ def fetch_ytmp3_results(query: str) -> List[str]:
 
 
 def _download_query_to_mp3(query: str, tmpdir: str) -> str:
-    ffmpeg_path = "./api/bin/ffmpeg"
-    ffprobe_path = "./api/bin/ffprobe"
+    ffmpeg_path = "./bin/ffmpeg"
+    ffprobe_path = "./bin/ffprobe"
 
     try:
         from yt_dlp import YoutubeDL

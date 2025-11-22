@@ -51,23 +51,28 @@ def _download_query_to_mp3(query: str, tmpdir: str) -> str:
         raise RuntimeError("yt-dlp is not installed") from e
 
     outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
-    ydl_opts = {
-    "format": "bestaudio/best",
-    "outtmpl": outtmpl,
-    "noplaylist": True,
-    "quiet": True,
-    "no_warnings": True,
-    "postprocessors": [
-        {
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }
-    ],
-    "prefer_ffmpeg": True,
-    "ffmpeg_location": ffmpeg_path
-}
 
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ],
+        "prefer_ffmpeg": True,
+        "ffmpeg_location": ffmpeg_path,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web"]
+            }
+        }
+    }
 
     ydl = YoutubeDL(ydl_opts)
     search_url = f"ytsearch1:{query}"
@@ -123,4 +128,3 @@ def get_music(search: SearchRequest):
     safe_name = f"{query}.mp3".replace('"', "'")
     headers = {"Content-Disposition": f'attachment; filename="{safe_name}"'}
     return StreamingResponse(iterfile(mp3_path, tmpdir), media_type="audio/mpeg", headers=headers)
-

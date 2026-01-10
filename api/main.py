@@ -41,12 +41,14 @@ def download(data: DownloadIn):
     output_template = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
 
     cmd = [
-        "yt-dlp",
-        "-x",
-        "--audio-format", data.format,
-        "-o", output_template,
-        url
-    ]
+    "yt-dlp",
+    "--cookies", "cookies.txt",
+    "-x",
+    "--audio-format", data.format,
+    "-o", output_template,
+    url
+]
+
 
     result = subprocess.run(
         cmd,

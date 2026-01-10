@@ -1,4 +1,7 @@
 fastapi
 uvicorn
-ytmusicapi
 yt-dlp
+ytmusicapi
+pydantic
+requests
+spotdl

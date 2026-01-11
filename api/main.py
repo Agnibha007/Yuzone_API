@@ -4,13 +4,14 @@ from pydantic import BaseModel
 from ytmusicapi import YTMusic
 import subprocess
 import os
-import glob
+import tempfile
+import asyncio
 
 app = FastAPI()
 ytmusic = YTMusic()
 
-DOWNLOAD_DIR = os.path.abspath("downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# allow at most 5 downloads running at the same time
+download_semaphore = asyncio.Semaphore(5)
 
 
 class DownloadIn(BaseModel):
@@ -24,68 +25,98 @@ def root():
 
 
 @app.post("/download")
-def download(data: DownloadIn):
-    # 1. Search song
-    results = ytmusic.search(data.query, filter="songs", limit=1)
-    if not results:
-        raise HTTPException(404, "No song found")
+async def download(data: DownloadIn):
+    async with download_semaphore:
+        # 1. Search song
+        results = ytmusic.search(data.query, filter="songs", limit=1)
+        if not results:
+            raise HTTPException(404, "No song found")
 
-    song = results[0]
-    video_id = song.get("videoId")
-    if not video_id:
-        raise HTTPException(500, "Invalid video ID")
+        song = results[0]
+        video_id = song.get("videoId")
+        if not video_id:
+            raise HTTPException(500, "Invalid video ID")
 
-    url = f"https://music.youtube.com/watch?v={video_id}"
+        url = f"https://music.youtube.com/watch?v={video_id}"
 
-    # 2. Download with ytdlp
-    output_template = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+        # 2. Isolated temp directory (critical)
+        tmpdir = tempfile.mkdtemp(prefix="dl_")
+        output_template = os.path.join(tmpdir, "%(title)s.%(ext)s")
 
-    cmd = [
-    "yt-dlp",
-    "--cookies", "cookies.txt",
-    "-x",
-    "--audio-format", data.format,
-    "-o", output_template,
-    url
-]
+        cmd = [
+            "yt-dlp",
+            "-f", "bestaudio/best",
+            "--extractor-args", "youtube:player_client=android",
+            "-x",
+            "--audio-format", data.format,
+            "-o", output_template,
+            url
+        ]
 
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
 
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
+        _, stderr = await process.communicate()
 
-    if result.returncode != 0:
-        raise HTTPException(500, result.stderr.decode(errors="ignore"))
+        if process.returncode != 0:
+            raise HTTPException(500, stderr.decode(errors="ignore"))
 
-    # 3. Find downloaded file
-    files = glob.glob(os.path.join(DOWNLOAD_DIR, f"*.{data.format}"))
-    if not files:
-        raise HTTPException(500, "Audio file not created")
+        # 3. Locate the downloaded file
+        files = [
+            f for f in os.listdir(tmpdir)
+            if f.endswith(f".{data.format}")
+        ]
 
-    file_path = files[0]
-    filename = os.path.basename(file_path)
+        if not files:
+            raise HTTPException(500, "Audio file not created")
 
-    # 4. Stream file and delete after sending
-    def file_stream():
-        try:
-            with open(file_path, "rb") as f:
-                while True:
-                    chunk = f.read(8192)
-                    if not chunk:
-                        break
-                    yield chunk
-        finally:
+        file_path = os.path.join(tmpdir, files[0])
+        filename = files[0]
+
+        # 4. Stream & cleanup (per-request safe)
+        def file_stream():
             try:
-                os.remove(file_path)
-            except OSError:
-                pass
+                with open(file_path, "rb") as f:
+                    while True:
+                        chunk = f.read(8192)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                try:
+                    os.remove(file_path)
+                    os.rmdir(tmpdir)
+                except OSError:
+                    pass
 
-    return StreamingResponse(
-        file_stream(),
-        media_type="audio/mpeg",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
-        }
-    )
+        return StreamingResponse(
+            file_stream(),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            }
+        )
+    
+@app.get("/search")
+def search(q: str):
+    results = ytmusic.search(q, filter="songs", limit=20)
+
+    if not results:
+        raise HTTPException(404, "No results found")
+
+    formatted_results = []
+    for item in results:
+        formatted_results.append({
+            "title": item.get("title"),
+            "artists": [artist.get("name") for artist in item.get("artists", [])],
+            "thumbnail": item.get("thumbnails", [{}])[-1].get("url")
+        })
+
+    return formatted_results
+
+
+
+#icon, song name, singers

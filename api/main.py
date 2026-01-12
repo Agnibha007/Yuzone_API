@@ -112,6 +112,7 @@ def search(q: str):
         formatted_results.append({
             "title": item.get("title"),
             "artists": [artist.get("name") for artist in item.get("artists", [])],
+            "duration": item.get("duration"),
             "thumbnail": item.get("thumbnails", [{}])[-1].get("url")
         })
 

@@ -15,7 +15,7 @@ download_semaphore = asyncio.Semaphore(5)
 
 
 class DownloadIn(BaseModel):
-    query: str
+    videoId: str
     format: str = "mp3"
 
 
@@ -27,17 +27,8 @@ def root():
 @app.post("/download")
 async def download(data: DownloadIn):
     async with download_semaphore:
-        # 1. Search song
-        results = ytmusic.search(data.query, filter="songs", limit=1)
-        if not results:
-            raise HTTPException(404, "No song found")
-
-        song = results[0]
-        video_id = song.get("videoId")
-        if not video_id:
-            raise HTTPException(500, "Invalid video ID")
-
-        url = f"https://music.youtube.com/watch?v={video_id}"
+        # Build URL directly from videoId (avoids search-triggered bot detection)
+        url = f"https://music.youtube.com/watch?v={data.videoId}"
 
         # 2. Isolated temp directory (critical)
         tmpdir = tempfile.mkdtemp(prefix="dl_")

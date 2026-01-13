@@ -6,6 +6,8 @@ import subprocess
 import os
 import tempfile
 import asyncio
+import sys
+import urllib.parse
 
 app = FastAPI()
 ytmusic = YTMusic()
@@ -13,9 +15,13 @@ ytmusic = YTMusic()
 # allow at most 5 downloads running at the same time
 download_semaphore = asyncio.Semaphore(5)
 
+# Windows asyncio fix: enable subprocess support
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 
 class DownloadIn(BaseModel):
-    query: str
+    videoId: str
     format: str = "mp3"
 
 
@@ -27,15 +33,10 @@ def root():
 @app.post("/download")
 async def download(data: DownloadIn):
     async with download_semaphore:
-        # 1. Search song
-        results = ytmusic.search(data.query, filter="songs", limit=1)
-        if not results:
-            raise HTTPException(404, "No song found")
-
-        song = results[0]
-        video_id = song.get("videoId")
+        # 1. Validate & build URL from provided videoId
+        video_id = (data.videoId or "").strip()
         if not video_id:
-            raise HTTPException(500, "Invalid video ID")
+            raise HTTPException(400, "videoId is required")
 
         url = f"https://music.youtube.com/watch?v={video_id}"
 
@@ -73,16 +74,13 @@ async def download(data: DownloadIn):
         if use_cookies:
             cmd.extend(["--cookies", cookies_path])
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        # Use thread-based subprocess on Windows-compatible event loops
+        def run_dl():
+            return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        _, stderr = await process.communicate()
-
+        process = await asyncio.to_thread(run_dl)
         if process.returncode != 0:
-            raise HTTPException(500, stderr.decode(errors="ignore"))
+            raise HTTPException(500, process.stderr.decode(errors="ignore"))
 
         # 3. Locate the downloaded file
         files = [
@@ -112,11 +110,18 @@ async def download(data: DownloadIn):
                 except OSError:
                     pass
 
+        # Build ASCII-safe Content-Disposition with RFC 5987 filename*
+        name_only, ext = os.path.splitext(filename)
+        safe_ascii_name = "".join(c if (ord(c) < 128 and c not in [';', '"']) else '_' for c in name_only) or "download"
+        safe_ascii = safe_ascii_name + ext
+        encoded = urllib.parse.quote(filename)
+        content_disp = f"attachment; filename=\"{safe_ascii}\"; filename*=UTF-8''{encoded}"
+
         return StreamingResponse(
             file_stream(),
             media_type="audio/mpeg",
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
+                "Content-Disposition": content_disp
             }
         )
     
@@ -148,7 +153,54 @@ def top_songs():
     except Exception as exc:  # network or API errors
         raise HTTPException(500, f"Failed to fetch charts: {exc}")
 
-    tracks = charts.get("tracks") or []
+    # YTMusic may return different keys/use nested structures across versions/regions.
+    candidate_lists = []
+    for key in ["tracks", "songs", "topSongs", "trending", "hotlist"]:
+        val = charts.get(key)
+        if isinstance(val, list):
+            candidate_lists.append(val)
+        elif isinstance(val, dict):
+            if isinstance(val.get("results"), list):
+                candidate_lists.append(val["results"])
+            elif isinstance(val.get("items"), list):
+                candidate_lists.append(val["items"])
+
+    # pick first non-empty candidate list
+    tracks = next((lst for lst in candidate_lists if lst), [])
+    if not tracks:
+        # Fallback: try popular India playlists and return their first 10 tracks
+        playlist_queries = [
+            "Top 100 India",
+            "India Top Hits",
+            "Bollywood Top Hits",
+            "Trending India",
+            "Top Songs India"
+        ]
+
+        playlist_id = None
+        for q in playlist_queries:
+            try:
+                plist_results = ytmusic.search(q, filter="playlists", limit=5)
+            except Exception:
+                plist_results = []
+
+            # Pick the first reasonable match that mentions India/Top/Trending
+            for r in plist_results:
+                title = (r.get("title") or "").lower()
+                if ("india" in title and ("top" in title or "trending" in title or "hits" in title)) or "bollywood" in title:
+                    playlist_id = r.get("playlistId") or r.get("browseId")
+                    if playlist_id:
+                        break
+            if playlist_id:
+                break
+
+        if playlist_id:
+            try:
+                playlist = ytmusic.get_playlist(playlist_id, limit=50)
+                tracks = playlist.get("tracks") or []
+            except Exception:
+                tracks = []
+
     if not tracks:
         raise HTTPException(404, "No chart data found")
 

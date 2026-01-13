@@ -50,3 +50,11 @@ Notes
 - After installing, re-open your terminal or restart your system shell so PATH changes take effect.
 - `yt-dlp` relies on ffmpeg for audio extraction/encoding. If ffmpeg is not available, the `/getmusic` endpoint will return an error indicating ffmpeg is missing.
 - If you'd like, I can add an automated helper to download a static ffmpeg build into the project at runtime (platform-specific). Let me know if you want that option.
+
+Deploying to Render
+
+- This repo includes [render.yaml](render.yaml) so you can click "New +" → "Blueprint" in the Render dashboard and point to this repository.
+- Build installs ffmpeg (`apt-get install -y ffmpeg`) and the Python deps, and starts with `uvicorn api.main:app --host 0.0.0.0 --port $PORT`.
+- Make sure the repo is public or connect your Git provider so Render can pull it; auto-deploy is enabled in the blueprint.
+- Health check: the root endpoint `/` returns `{"status": "local downloader running"}` once the service is up.
+- Top charts: `/top` returns the current top 10 songs in India (rank, title, singer, cover art, videoId).

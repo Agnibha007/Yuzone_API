@@ -113,11 +113,41 @@ def search(q: str):
             "title": item.get("title"),
             "artists": [artist.get("name") for artist in item.get("artists", [])],
             "duration": item.get("duration"),
-            "thumbnail": item.get("thumbnails", [{}])[-1].get("url")
+            "thumbnail": item.get("thumbnails", [{}])[-1].get("url"),
+            "videoId": item.get("videoId")
         })
 
     return formatted_results
 
 
+
+@app.get("/top")
+def top_songs():
+    try:
+        charts = ytmusic.get_charts(country="IN")
+    except Exception as exc:  # network or API errors
+        raise HTTPException(500, f"Failed to fetch charts: {exc}")
+
+    tracks = charts.get("tracks") or []
+    if not tracks:
+        raise HTTPException(404, "No chart data found")
+
+    top = []
+    for idx, item in enumerate(tracks[:10], start=1):
+        artists = ", ".join(
+            [artist.get("name") for artist in item.get("artists", []) if artist.get("name")]
+        )
+        thumbnails = item.get("thumbnails") or []
+        cover = thumbnails[-1].get("url") if thumbnails else None
+
+        top.append({
+            "rank": idx,
+            "songName": item.get("title"),
+            "singer": artists,
+            "coverPageUrl": cover,
+            "videoId": item.get("videoId")
+        })
+
+    return {"tracks": top}
 
 #icon, song name, singers

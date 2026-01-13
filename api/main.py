@@ -43,15 +43,35 @@ async def download(data: DownloadIn):
         tmpdir = tempfile.mkdtemp(prefix="dl_")
         output_template = os.path.join(tmpdir, "%(title)s.%(ext)s")
 
+        # Optional: pass cookies if available to avoid bot verification/age/country blocks
+        cookies_path = os.path.join(os.path.dirname(__file__), "..", "cookies.txt")
+        use_cookies = False
+        if os.path.exists(cookies_path):
+            try:
+                with open(cookies_path, "r", encoding="utf-8", errors="ignore") as fh:
+                    head = fh.read(200)
+                    # yt-dlp expects Netscape HTTP Cookie File format; skip if not
+                    use_cookies = "Netscape HTTP Cookie File" in head
+            except OSError:
+                use_cookies = False
+
+        # Prefer m4a when available, otherwise bestaudio/best. Avoid android client when cookies are used.
+        format_selector = "bestaudio[ext=m4a]/bestaudio/best"
         cmd = [
             "yt-dlp",
-            "-f", "bestaudio/best",
-            "--extractor-args", "youtube:player_client=android",
+            "-f", format_selector,
             "-x",
             "--audio-format", data.format,
             "-o", output_template,
             url
         ]
+
+        # When not using cookies, keep the android player client which often works without auth.
+        if not use_cookies:
+            cmd.extend(["--extractor-args", "youtube:player_client=android"])
+
+        if use_cookies:
+            cmd.extend(["--cookies", cookies_path])
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -113,11 +133,41 @@ def search(q: str):
             "title": item.get("title"),
             "artists": [artist.get("name") for artist in item.get("artists", [])],
             "duration": item.get("duration"),
-            "thumbnail": item.get("thumbnails", [{}])[-1].get("url")
+            "thumbnail": item.get("thumbnails", [{}])[-1].get("url"),
+            "videoId": item.get("videoId")
         })
 
     return formatted_results
 
 
+
+@app.get("/top")
+def top_songs():
+    try:
+        charts = ytmusic.get_charts(country="IN")
+    except Exception as exc:  # network or API errors
+        raise HTTPException(500, f"Failed to fetch charts: {exc}")
+
+    tracks = charts.get("tracks") or []
+    if not tracks:
+        raise HTTPException(404, "No chart data found")
+
+    top = []
+    for idx, item in enumerate(tracks[:10], start=1):
+        artists = ", ".join(
+            [artist.get("name") for artist in item.get("artists", []) if artist.get("name")]
+        )
+        thumbnails = item.get("thumbnails") or []
+        cover = thumbnails[-1].get("url") if thumbnails else None
+
+        top.append({
+            "rank": idx,
+            "songName": item.get("title"),
+            "singer": artists,
+            "coverPageUrl": cover,
+            "videoId": item.get("videoId")
+        })
+
+    return {"tracks": top}
 
 #icon, song name, singers

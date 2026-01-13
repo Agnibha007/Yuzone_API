@@ -45,7 +45,15 @@ async def download(data: DownloadIn):
 
         # Optional: pass cookies if available to avoid bot verification/age/country blocks
         cookies_path = os.path.join(os.path.dirname(__file__), "..", "cookies.txt")
-        use_cookies = os.path.exists(cookies_path)
+        use_cookies = False
+        if os.path.exists(cookies_path):
+            try:
+                with open(cookies_path, "r", encoding="utf-8", errors="ignore") as fh:
+                    head = fh.read(200)
+                    # yt-dlp expects Netscape HTTP Cookie File format; skip if not
+                    use_cookies = "Netscape HTTP Cookie File" in head
+            except OSError:
+                use_cookies = False
 
         cmd = [
             "yt-dlp",

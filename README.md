@@ -59,4 +59,4 @@ Deploying to Render
 - Health check: the root endpoint `/` returns `{"status": "local downloader running"}` once the service is up.
 - Top charts: `/top` returns the current top 10 songs in India (rank, title, singer, cover art, videoId).
 - Search: `/search?q=` returns title, artists, duration, thumbnail, videoId.
-- Download: `/download` accepts `{ "query": "song name", "format": "mp3" }`. If you hit YouTube bot/age prompts, add exported cookies to [cookies.txt](cookies.txt) (Render will read it automatically during build).
+- Download: `/download` accepts `{ "query": "song name", "format": "mp3" }`. If you hit YouTube bot/age prompts, add exported cookies to [cookies.txt](cookies.txt) (Render will read it automatically during build). The file must be in "Netscape HTTP Cookie File" format (the default when exporting via the yt-dlp FAQ instructions); otherwise cookies are ignored.

@@ -6,18 +6,12 @@ import subprocess
 import os
 import tempfile
 import asyncio
-import sys
-import urllib.parse
 
 app = FastAPI()
 ytmusic = YTMusic()
 
 # allow at most 5 downloads running at the same time
 download_semaphore = asyncio.Semaphore(5)
-
-# Windows asyncio fix: enable subprocess support
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 class DownloadIn(BaseModel):
@@ -33,10 +27,9 @@ def root():
 @app.post("/download")
 async def download(data: DownloadIn):
     async with download_semaphore:
-        # 1. Validate & build URL from provided videoId
-        video_id = (data.videoId or "").strip()
+        video_id = data.videoId
         if not video_id:
-            raise HTTPException(400, "videoId is required")
+            raise HTTPException(500, "Invalid video ID")
 
         url = f"https://music.youtube.com/watch?v={video_id}"
 
@@ -74,13 +67,16 @@ async def download(data: DownloadIn):
         if use_cookies:
             cmd.extend(["--cookies", cookies_path])
 
-        # Use thread-based subprocess on Windows-compatible event loops
-        def run_dl():
-            return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
 
-        process = await asyncio.to_thread(run_dl)
+        _, stderr = await process.communicate()
+
         if process.returncode != 0:
-            raise HTTPException(500, process.stderr.decode(errors="ignore"))
+            raise HTTPException(500, stderr.decode(errors="ignore"))
 
         # 3. Locate the downloaded file
         files = [
@@ -110,18 +106,11 @@ async def download(data: DownloadIn):
                 except OSError:
                     pass
 
-        # Build ASCII-safe Content-Disposition with RFC 5987 filename*
-        name_only, ext = os.path.splitext(filename)
-        safe_ascii_name = "".join(c if (ord(c) < 128 and c not in [';', '"']) else '_' for c in name_only) or "download"
-        safe_ascii = safe_ascii_name + ext
-        encoded = urllib.parse.quote(filename)
-        content_disp = f"attachment; filename=\"{safe_ascii}\"; filename*=UTF-8''{encoded}"
-
         return StreamingResponse(
             file_stream(),
             media_type="audio/mpeg",
             headers={
-                "Content-Disposition": content_disp
+                "Content-Disposition": f'attachment; filename="{filename}"'
             }
         )
     

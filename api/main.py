@@ -55,15 +55,20 @@ async def download(data: DownloadIn):
             except OSError:
                 use_cookies = False
 
+        # Prefer m4a when available, otherwise bestaudio/best. Avoid android client when cookies are used.
+        format_selector = "bestaudio[ext=m4a]/bestaudio/best"
         cmd = [
             "yt-dlp",
-            "-f", "bestaudio/best",
-            "--extractor-args", "youtube:player_client=android",
+            "-f", format_selector,
             "-x",
             "--audio-format", data.format,
             "-o", output_template,
             url
         ]
+
+        # When not using cookies, keep the android player client which often works without auth.
+        if not use_cookies:
+            cmd.extend(["--extractor-args", "youtube:player_client=android"])
 
         if use_cookies:
             cmd.extend(["--cookies", cookies_path])

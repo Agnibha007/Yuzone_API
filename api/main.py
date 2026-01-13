@@ -43,6 +43,10 @@ async def download(data: DownloadIn):
         tmpdir = tempfile.mkdtemp(prefix="dl_")
         output_template = os.path.join(tmpdir, "%(title)s.%(ext)s")
 
+        # Optional: pass cookies if available to avoid bot verification/age/country blocks
+        cookies_path = os.path.join(os.path.dirname(__file__), "..", "cookies.txt")
+        use_cookies = os.path.exists(cookies_path)
+
         cmd = [
             "yt-dlp",
             "-f", "bestaudio/best",
@@ -52,6 +56,9 @@ async def download(data: DownloadIn):
             "-o", output_template,
             url
         ]
+
+        if use_cookies:
+            cmd.extend(["--cookies", cookies_path])
 
         process = await asyncio.create_subprocess_exec(
             *cmd,

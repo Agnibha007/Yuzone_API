@@ -55,8 +55,7 @@ async def download(data: DownloadIn):
             "--audio-format", data.format,
             "-o", output_template,
             "--extractor-args", "youtube:player_client=web",
-            "--socket-timeout", "30",
-            "--http-chunk-size", "10485760",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             url
         ]
 
@@ -73,7 +72,32 @@ async def download(data: DownloadIn):
         _, stderr = await process.communicate()
 
         if process.returncode != 0:
-            raise HTTPException(500, stderr.decode(errors="ignore"))
+            error_msg = stderr.decode(errors="ignore")
+            # If auth error and we have cookies, try without cookies using android client
+            if "Sign in to confirm" in error_msg and use_cookies:
+                cmd = [
+                    "yt-dlp",
+                    "-f", format_selector,
+                    "-x",
+                    "--audio-format", data.format,
+                    "-o", output_template,
+                    "--extractor-args", "youtube:player_client=android_music",
+                    "--user-agent", "Mozilla/5.0",
+                    url
+                ]
+                
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                _, stderr = await process.communicate()
+                
+                if process.returncode != 0:
+                    raise HTTPException(500, stderr.decode(errors="ignore"))
+            else:
+                raise HTTPException(500, error_msg)
 
         # 3. Locate the downloaded file
         files = [

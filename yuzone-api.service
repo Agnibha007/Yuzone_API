@@ -4,11 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-User=YOUR_USERNAME
-WorkingDirectory=/home/YOUR_USERNAME/projects/Yuzone_API
-Environment="PATH=/home/YOUR_USERNAME/projects/Yuzone_API/.venv/bin"
-Environment="RAPIDAPI_KEY=YOUR_RAPIDAPI_KEY"
-ExecStart=/home/YOUR_USERNAME/projects/Yuzone_API/.venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000
+User=agnibha
+WorkingDirectory=/home/agnibha/projects/Yuzone_API
+Environment="PATH=/home/agnibha/projects/Yuzone_API/.venv/bin"
+Environment="RAPIDAPI_KEY=b9fb0591d7msh17f698b9f90efeep19da34jsndc5f07d878b3"
+ExecStart=/home/agnibha/projects/Yuzone_API/.venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=3
 

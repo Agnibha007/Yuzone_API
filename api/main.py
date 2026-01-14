@@ -48,6 +48,8 @@ async def download(data: DownloadIn):
 
         # Prefer m4a when available, otherwise bestaudio/best
         format_selector = "bestaudio[ext=m4a]/bestaudio/best"
+        
+        # Build command with proper authentication
         cmd = [
             "yt-dlp",
             "-f", format_selector,
@@ -55,13 +57,16 @@ async def download(data: DownloadIn):
             "--audio-format", data.format,
             "-o", output_template,
             "--extractor-args", "youtube:player_client=web",
-            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "--socket-timeout", "30",
             url
         ]
 
         # Use cookies for authentication if available
         if use_cookies:
             cmd.extend(["--cookies", cookies_path])
+        else:
+            # If no cookies, try to extract from browser
+            cmd.extend(["--cookies-from-browser", "chrome:auto"])
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -73,16 +78,17 @@ async def download(data: DownloadIn):
 
         if process.returncode != 0:
             error_msg = stderr.decode(errors="ignore")
-            # If auth error and we have cookies, try without cookies using android client
-            if "Sign in to confirm" in error_msg and use_cookies:
+            # If auth/bot error, retry without browser cookies
+            if ("Sign in to confirm" in error_msg or "bot" in error_msg.lower()) and not use_cookies:
                 cmd = [
                     "yt-dlp",
                     "-f", format_selector,
                     "-x",
                     "--audio-format", data.format,
                     "-o", output_template,
-                    "--extractor-args", "youtube:player_client=android_music",
-                    "--user-agent", "Mozilla/5.0",
+                    "--extractor-args", "youtube:player_client=web",
+                    "--extractor-args", "youtube:sts=",
+                    "--socket-timeout", "30",
                     url
                 ]
                 

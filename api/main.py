@@ -9,6 +9,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+import httpx
 
 app = FastAPI()
 ytmusic = YTMusic()
@@ -153,6 +154,78 @@ async def download_direct(data: DownloadIn):
             media_type="audio/mpeg",
             headers={"Content-Disposition": f'attachment; filename="{video_id}.{format_ext}"'}
         )
+
+    # Try Method 0: RapidAPI (preferred, handles bot-detection)
+    rapidapi_key = os.getenv("RAPIDAPI_KEY")
+    rapidapi_host = "youtube-media-downloader.p.rapidapi.com"
+    if rapidapi_key:
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.get(
+                    f"https://{rapidapi_host}/v2/video/streams",
+                    params={"videoId": video_id},
+                    headers={
+                        "x-rapidapi-key": rapidapi_key,
+                        "x-rapidapi-host": rapidapi_host,
+                    }
+                )
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    streams = data.get("streams") or data.get("formats") or []
+
+                    # Pick best audio-only stream
+                    audio_streams = []
+                    for s in streams:
+                        mime = (s.get("mimeType") or s.get("type") or "").lower()
+                        if "audio" in mime:
+                            audio_streams.append(s)
+
+                    if audio_streams:
+                        # sort by bitrate descending if available
+                        audio_streams.sort(key=lambda x: x.get("bitrate") or x.get("kbps") or 0, reverse=True)
+                        best = audio_streams[0]
+                        audio_url = best.get("url") or best.get("downloadUrl")
+
+                        if audio_url:
+                            tmpdir = tempfile.mkdtemp(prefix="dl_")
+                            temp_file = os.path.join(tmpdir, f"{video_id}.{format_ext}")
+
+                            async with client.stream("GET", audio_url) as dresp:
+                                dresp.raise_for_status()
+                                with open(temp_file, "wb") as f:
+                                    async for chunk in dresp.aiter_bytes(65536):
+                                        f.write(chunk)
+
+                            # Cache file
+                            try:
+                                import shutil
+                                shutil.copy2(temp_file, cached_file)
+                            except Exception:
+                                pass
+
+                            def file_stream():
+                                try:
+                                    with open(temp_file, "rb") as f:
+                                        while True:
+                                            chunk = f.read(65536)
+                                            if not chunk:
+                                                break
+                                            yield chunk
+                                finally:
+                                    try:
+                                        import shutil
+                                        shutil.rmtree(tmpdir)
+                                    except Exception:
+                                        pass
+
+                            return StreamingResponse(
+                                file_stream(),
+                                media_type="audio/mpeg",
+                                headers={"Content-Disposition": f'attachment; filename="{video_id}.{format_ext}"'}
+                            )
+        except Exception as exc:
+            print(f"RapidAPI download failed: {exc}")
     
     tmpdir = tempfile.mkdtemp(prefix="dl_")
     url = f"https://www.youtube.com/watch?v={video_id}"

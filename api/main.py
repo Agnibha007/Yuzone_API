@@ -122,6 +122,10 @@ async def download(data: DownloadIn):
         try:
             from yt_dlp import YoutubeDL
             
+            # Get ffmpeg location from bin/ directory
+            bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
+            ffmpeg_path = os.path.join(bin_dir, 'ffmpeg')
+            
             ydl_opts = {
                 'format': 'bestaudio[ext=m4a]/bestaudio/best',
                 'postprocessors': [{
@@ -133,6 +137,7 @@ async def download(data: DownloadIn):
                 'quiet': True,
                 'no_warnings': True,
                 'socket_timeout': 30,
+                'ffmpeg_location': bin_dir,
             }
             
             def download_sync():
@@ -422,6 +427,10 @@ async def download_direct(data: DownloadIn):
     try:
         from yt_dlp import YoutubeDL
         
+        # Get ffmpeg location from bin/ directory
+        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
+        ffmpeg_path = os.path.join(bin_dir, 'ffmpeg')
+        
         ydl_opts = {
             'format': 'bestaudio[ext=m4a]/bestaudio/best',
             'postprocessors': [{
@@ -433,6 +442,7 @@ async def download_direct(data: DownloadIn):
             'quiet': True,
             'no_warnings': True,
             'socket_timeout': 30,
+            'ffmpeg_location': bin_dir,
         }
         
         def download_sync():

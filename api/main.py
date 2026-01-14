@@ -46,7 +46,7 @@ async def download(data: DownloadIn):
             except OSError:
                 use_cookies = False
 
-        # Prefer m4a when available, otherwise bestaudio/best. Avoid android client when cookies are used.
+        # Prefer m4a when available, otherwise bestaudio/best
         format_selector = "bestaudio[ext=m4a]/bestaudio/best"
         cmd = [
             "yt-dlp",
@@ -54,13 +54,13 @@ async def download(data: DownloadIn):
             "-x",
             "--audio-format", data.format,
             "-o", output_template,
+            "--extractor-args", "youtube:player_client=web",
+            "--socket-timeout", "30",
+            "--http-chunk-size", "10485760",
             url
         ]
 
-        # When not using cookies, keep the android player client which often works without auth.
-        if not use_cookies:
-            cmd.extend(["--extractor-args", "youtube:player_client=android"])
-
+        # Use cookies for authentication if available
         if use_cookies:
             cmd.extend(["--cookies", cookies_path])
 
@@ -135,29 +135,80 @@ def search(q: str):
 @app.get("/top")
 def top_songs():
     try:
-        charts = ytmusic.get_charts(country="IN")
-    except Exception as exc:  # network or API errors
-        raise HTTPException(500, f"Failed to fetch charts: {exc}")
-
-    tracks = charts.get("tracks") or []
-    if not tracks:
-        raise HTTPException(404, "No chart data found")
+        # Try get_home first - returns featured playlists and trending content
+        home_data = ytmusic.get_home()
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to fetch home data: {exc}")
 
     top = []
-    for idx, item in enumerate(tracks[:10], start=1):
-        artists = ", ".join(
-            [artist.get("name") for artist in item.get("artists", []) if artist.get("name")]
-        )
-        thumbnails = item.get("thumbnails") or []
-        cover = thumbnails[-1].get("url") if thumbnails else None
-
-        top.append({
-            "rank": idx,
-            "songName": item.get("title"),
-            "singer": artists,
-            "coverPageUrl": cover,
-            "videoId": item.get("videoId")
-        })
+    
+    # Extract tracks from various sections in home data
+    if isinstance(home_data, list):
+        for section in home_data:
+            if not isinstance(section, dict):
+                continue
+            
+            # Look for playlist or chart section
+            contents = section.get("contents", [])
+            if not contents:
+                continue
+            
+            for item in contents:
+                if not isinstance(item, dict):
+                    continue
+                
+                video_id = item.get("videoId")
+                if not video_id:
+                    continue
+                
+                artists = ", ".join(
+                    [artist.get("name") for artist in item.get("artists", []) if artist.get("name")]
+                )
+                thumbnails = item.get("thumbnails") or []
+                cover = thumbnails[-1].get("url") if thumbnails else None
+                
+                top.append({
+                    "rank": len(top) + 1,
+                    "songName": item.get("title"),
+                    "singer": artists,
+                    "coverPageUrl": cover,
+                    "videoId": video_id
+                })
+                
+                # Stop at 10 songs
+                if len(top) >= 10:
+                    break
+            
+            if len(top) >= 10:
+                break
+    
+    # Fallback: search for trending Indian songs if home data didn't work
+    if not top:
+        try:
+            results = ytmusic.search("trending india songs", filter="songs", limit=10)
+            for idx, item in enumerate(results[:10], start=1):
+                video_id = item.get("videoId")
+                if not video_id:
+                    continue
+                    
+                artists = ", ".join(
+                    [artist.get("name") for artist in item.get("artists", []) if artist.get("name")]
+                )
+                thumbnails = item.get("thumbnails") or []
+                cover = thumbnails[-1].get("url") if thumbnails else None
+                
+                top.append({
+                    "rank": idx,
+                    "songName": item.get("title"),
+                    "singer": artists,
+                    "coverPageUrl": cover,
+                    "videoId": video_id
+                })
+        except Exception:
+            pass
+    
+    if not top:
+        raise HTTPException(404, "No chart data found")
 
     return {"tracks": top}
 

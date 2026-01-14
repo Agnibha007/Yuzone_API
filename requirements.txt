@@ -5,3 +5,4 @@ ytmusicapi
 pydantic
 requests
 spotdl
+pytube

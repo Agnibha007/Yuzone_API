@@ -6,6 +6,7 @@ import subprocess
 import os
 import tempfile
 import asyncio
+from yt_dlp import YoutubeDL
 
 app = FastAPI()
 ytmusic = YTMusic()
@@ -27,119 +28,86 @@ def root():
 @app.post("/download")
 async def download(data: DownloadIn):
     async with download_semaphore:
-        # Build URL directly from videoId (avoids search-triggered bot detection)
-        url = f"https://music.youtube.com/watch?v={data.videoId}"
-
-        # 2. Isolated temp directory (critical)
+        url = f"https://www.youtube.com/watch?v={data.videoId}"
         tmpdir = tempfile.mkdtemp(prefix="dl_")
-        output_template = os.path.join(tmpdir, "%(title)s.%(ext)s")
-
-        # Optional: pass cookies if available to avoid bot verification/age/country blocks
-        cookies_path = os.path.join(os.path.dirname(__file__), "..", "cookies.txt")
-        use_cookies = False
-        if os.path.exists(cookies_path):
-            try:
-                with open(cookies_path, "r", encoding="utf-8", errors="ignore") as fh:
-                    head = fh.read(200)
-                    # yt-dlp expects Netscape HTTP Cookie File format; skip if not
-                    use_cookies = "Netscape HTTP Cookie File" in head
-            except OSError:
-                use_cookies = False
-
-        # Prefer m4a when available, otherwise bestaudio/best
-        format_selector = "bestaudio[ext=m4a]/bestaudio/best"
         
-        # Build command with proper authentication
-        cmd = [
-            "yt-dlp",
-            "-f", format_selector,
-            "-x",
-            "--audio-format", data.format,
-            "-o", output_template,
-            "--extractor-args", "youtube:player_client=web",
-            "--socket-timeout", "30",
-            url
-        ]
-
-        # Use cookies for authentication if available
-        if use_cookies:
-            cmd.extend(["--cookies", cookies_path])
-        else:
-            # If no cookies, try to extract from browser
-            cmd.extend(["--cookies-from-browser", "chrome:auto"])
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        _, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            error_msg = stderr.decode(errors="ignore")
-            # If auth/bot error, retry without browser cookies
-            if ("Sign in to confirm" in error_msg or "bot" in error_msg.lower()) and not use_cookies:
-                cmd = [
-                    "yt-dlp",
-                    "-f", format_selector,
-                    "-x",
-                    "--audio-format", data.format,
-                    "-o", output_template,
-                    "--extractor-args", "youtube:player_client=web",
-                    "--extractor-args", "youtube:sts=",
-                    "--socket-timeout", "30",
-                    url
-                ]
-                
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                
-                _, stderr = await process.communicate()
-                
-                if process.returncode != 0:
-                    raise HTTPException(500, stderr.decode(errors="ignore"))
-            else:
-                raise HTTPException(500, error_msg)
-
-        # 3. Locate the downloaded file
-        files = [
-            f for f in os.listdir(tmpdir)
-            if f.endswith(f".{data.format}")
-        ]
-
-        if not files:
-            raise HTTPException(500, "Audio file not created")
-
-        file_path = os.path.join(tmpdir, files[0])
-        filename = files[0]
-
-        # 4. Stream & cleanup (per-request safe)
-        def file_stream():
-            try:
-                with open(file_path, "rb") as f:
-                    while True:
-                        chunk = f.read(8192)
-                        if not chunk:
-                            break
-                        yield chunk
-            finally:
-                try:
-                    os.remove(file_path)
-                    os.rmdir(tmpdir)
-                except OSError:
-                    pass
-
-        return StreamingResponse(
-            file_stream(),
-            media_type="audio/mpeg",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
+        try:
+            # Use YoutubeDL library directly without subprocess - optimized for speed
+            ydl_opts = {
+                'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': data.format,
+                    'preferredquality': '192',
+                }],
+                'outtmpl': os.path.join(tmpdir, '%(id)s'),
+                'quiet': True,
+                'no_warnings': True,
+                'socket_timeout': 30,
+                'retries': 3,
+                'fragment_retries': 3,
+                'concurrent_fragment_downloads': 4,  # Parallel fragment downloads
+                'extractor_args': {'youtube': {'player_client': 'web'}},
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                },
+                'encoding': 'utf-8',
+                'progress_hooks': [],  # Disable progress hooks for speed
             }
-        )
+            
+            def download_sync():
+                try:
+                    with YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        return info.get('id'), info.get('title')
+                except Exception as e:
+                    raise e
+            
+            # Run in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            video_id, title = await loop.run_in_executor(None, download_sync)
+            
+            # Find the downloaded file using video ID
+            files = [
+                f for f in os.listdir(tmpdir)
+                if f.endswith(f".{data.format}") and f.startswith(video_id)
+            ]
+            
+            if not files:
+                raise HTTPException(500, "Audio file not created")
+            
+            file_path = os.path.join(tmpdir, files[0])
+            # Use title if available, otherwise use filename
+            filename = f"{title}.{data.format}" if title else files[0]
+            # Sanitize filename for safe download
+            filename = "".join(c for c in filename if ord(c) < 128 or c in ' -_.')
+            if not filename or filename.startswith('.'):
+                filename = files[0]
+            
+            def file_stream():
+                try:
+                    with open(file_path, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)  # Larger buffer = faster streaming
+                            if not chunk:
+                                break
+                            yield chunk
+                finally:
+                    try:
+                        os.remove(file_path)
+                        os.rmdir(tmpdir)
+                    except OSError:
+                        pass
+            
+            return StreamingResponse(
+                file_stream(),
+                media_type="audio/mpeg",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"'
+                }
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Download failed: {str(e)}")
     
 @app.get("/search")
 def search(q: str):

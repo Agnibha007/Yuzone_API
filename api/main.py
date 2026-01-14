@@ -100,6 +100,7 @@ async def download(data: DownloadIn):
         cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
         if os.path.exists(cached_file):
             filename = f"{video_id}.{format_ext}"
+            file_size = os.path.getsize(cached_file)
             
             def cached_stream():
                 with open(cached_file, "rb") as f:
@@ -112,7 +113,11 @@ async def download(data: DownloadIn):
             return StreamingResponse(
                 cached_stream(),
                 media_type="audio/mpeg",
-                headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(file_size),
+                    "Accept-Ranges": "bytes"
+                }
             )
         
         # Perform direct download on server (works on localhost)
@@ -181,10 +186,16 @@ async def download(data: DownloadIn):
                     except:
                         pass
             
+            file_size = os.path.getsize(file_path)
+            
             return StreamingResponse(
                 file_stream(),
                 media_type="audio/mpeg",
-                headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(file_size),
+                    "Accept-Ranges": "bytes"
+                }
             )
             
         except Exception as e:
@@ -203,6 +214,8 @@ async def download_direct(data: DownloadIn):
     # Check cache first
     cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
     if os.path.exists(cached_file):
+        file_size = os.path.getsize(cached_file)
+        
         def cached_stream():
             with open(cached_file, "rb") as f:
                 while True:
@@ -214,7 +227,11 @@ async def download_direct(data: DownloadIn):
         return StreamingResponse(
             cached_stream(),
             media_type="audio/mpeg",
-            headers={"Content-Disposition": f'attachment; filename="{video_id}.{format_ext}"'}
+            headers={
+                "Content-Disposition": f'attachment; filename="{video_id}.{format_ext}"',
+                "Content-Length": str(file_size),
+                "Accept-Ranges": "bytes"
+            }
         )
 
     # Try Method 0: RapidAPI (preferred, handles bot-detection)
@@ -281,10 +298,16 @@ async def download_direct(data: DownloadIn):
                                     except Exception:
                                         pass
 
+                            file_size = os.path.getsize(temp_file)
+                            
                             return StreamingResponse(
                                 file_stream(),
                                 media_type="audio/mpeg",
-                                headers={"Content-Disposition": f'attachment; filename="{video_id}.{format_ext}"'}
+                                headers={
+                                    "Content-Disposition": f'attachment; filename="{video_id}.{format_ext}"',
+                                    "Content-Length": str(file_size),
+                                    "Accept-Ranges": "bytes"
+                                }
                             )
         except Exception as exc:
             print(f"RapidAPI download failed: {exc}")
@@ -354,10 +377,16 @@ async def download_direct(data: DownloadIn):
                         except:
                             pass
                 
+                file_size = os.path.getsize(output_file)
+                
                 return StreamingResponse(
                     file_stream(),
                     media_type="audio/mpeg",
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{filename}"',
+                        "Content-Length": str(file_size),
+                        "Accept-Ranges": "bytes"
+                    }
                 )
     except Exception as e:
         print(f"you-get failed: {e}")
@@ -415,10 +444,16 @@ async def download_direct(data: DownloadIn):
                         except:
                             pass
                 
+                file_size = os.path.getsize(output_file)
+                
                 return StreamingResponse(
                     file_stream(),
                     media_type="audio/mpeg",
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{filename}"',
+                        "Content-Length": str(file_size),
+                        "Accept-Ranges": "bytes"
+                    }
                 )
     except Exception as e:
         print(f"pytube failed: {e}")
@@ -482,10 +517,16 @@ async def download_direct(data: DownloadIn):
                     except:
                         pass
             
+            file_size = os.path.getsize(file_path)
+            
             return StreamingResponse(
                 file_stream(),
                 media_type="audio/mpeg",
-                headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(file_size),
+                    "Accept-Ranges": "bytes"
+                }
             )
     except Exception as e:
         print(f"yt-dlp failed: {e}")
@@ -555,6 +596,8 @@ def update_manifest(video_id, format_ext):
 
 async def stream_file(file_path, filename, tmpdir):
     """Stream file and cleanup"""
+    file_size = os.path.getsize(file_path)
+    
     def file_stream():
         try:
             with open(file_path, "rb") as f:
@@ -573,7 +616,11 @@ async def stream_file(file_path, filename, tmpdir):
     return StreamingResponse(
         file_stream(),
         media_type="audio/mpeg",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes"
+        }
     )
     
 @app.get("/search")

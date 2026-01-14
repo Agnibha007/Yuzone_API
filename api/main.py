@@ -38,7 +38,7 @@ async def download(data: DownloadIn):
         video_id = data.videoId
         format_ext = data.format
         
-        # Check cache first - FASTEST option for Render
+        # Check cache first
         cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
         if os.path.exists(cached_file):
             filename = f"{video_id}.{format_ext}"
@@ -57,78 +57,172 @@ async def download(data: DownloadIn):
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'}
             )
         
-        # Not in cache - try to download
+        # Perform direct download on server (works on localhost)
         tmpdir = tempfile.mkdtemp(prefix="dl_")
         url = f"https://www.youtube.com/watch?v={video_id}"
         
         try:
-            # Try method 1: pytube (works better on cloud servers)
-            try:
-                from pytube import YouTube
-                yt = YouTube(url)
-                stream = yt.streams.filter(only_audio=True).first()
-                if stream:
-                    temp_file = os.path.join(tmpdir, f"audio.{stream.default_audio_codec}")
-                    stream.download(output_path=tmpdir, filename=f"audio.{stream.default_audio_codec}")
-                    
-                    # Convert if needed
-                    if stream.default_audio_codec != format_ext:
-                        converted = await convert_audio(temp_file, format_ext, tmpdir)
-                        temp_file = converted
-                    
-                    title = yt.title or video_id
-                    await cache_file(temp_file, video_id, format_ext)
-                    return await stream_file(temp_file, f"{title}.{format_ext}", tmpdir)
-            except Exception as e:
-                print(f"pytube failed: {e}")
-            
-            # Try method 2: yt-dlp with simpler options
             from yt_dlp import YoutubeDL
+            
             ydl_opts = {
-                'format': 'bestaudio',
-                'outtmpl': os.path.join(tmpdir, '%(id)s'),
+                'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': format_ext,
+                    'preferredquality': '192',
+                }],
+                'outtmpl': os.path.join(tmpdir, 'audio'),
                 'quiet': True,
                 'no_warnings': True,
-                'extractor_args': {'youtube': {'player_client': 'web'}},
                 'socket_timeout': 30,
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                },
             }
             
             def download_sync():
                 with YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
-                    return info.get('id'), info.get('title')
+                    return info.get('title', video_id)
             
             loop = asyncio.get_event_loop()
-            vid_id, title = await loop.run_in_executor(None, download_sync)
+            title = await loop.run_in_executor(None, download_sync)
             
             # Find downloaded file
-            files = [f for f in os.listdir(tmpdir) if not f.startswith('.')]
+            files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
+            
             if not files:
-                raise Exception("No audio file downloaded")
+                raise HTTPException(500, "Audio file not created")
             
-            audio_file = os.path.join(tmpdir, files[0])
-            
-            # Convert to desired format if needed
-            if not audio_file.endswith(f".{format_ext}"):
-                audio_file = await convert_audio(audio_file, format_ext, tmpdir)
-            
-            # Cache the file
-            await cache_file(audio_file, video_id, format_ext)
-            
-            filename = f"{title}.{format_ext}" if title else f"{video_id}.{format_ext}"
+            file_path = os.path.join(tmpdir, files[0])
+            filename = f"{title}.{format_ext}" if title else files[0]
             filename = "".join(c for c in filename if ord(c) < 128 or c in ' -_.')
             
-            return await stream_file(audio_file, filename, tmpdir)
+            # Cache the file for future requests
+            try:
+                import shutil
+                cached_path = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
+                shutil.copy2(file_path, cached_path)
+            except:
+                pass
+            
+            def file_stream():
+                try:
+                    with open(file_path, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            yield chunk
+                finally:
+                    try:
+                        os.remove(file_path)
+                        os.rmdir(tmpdir)
+                    except:
+                        pass
+            
+            return StreamingResponse(
+                file_stream(),
+                media_type="audio/mpeg",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+            )
             
         except Exception as e:
-            error_msg = str(e)
-            # Return cached version if download fails on Render
-            if "Sign in" in error_msg or "bot" in error_msg.lower():
-                raise HTTPException(503, "YouTube blocking downloads from this server. Please try again later.")
-            raise HTTPException(500, f"Download failed: {error_msg}")
+            raise HTTPException(500, f"Download failed: {str(e)}")
+
+
+@app.post("/download/direct")
+async def download_direct(data: DownloadIn):
+    """
+    Direct download endpoint - executes on client's IP.
+    Client makes this request, so YouTube sees client IP not Render's IP.
+    """
+    video_id = data.videoId
+    format_ext = data.format
+    
+    # Check cache first
+    cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
+    if os.path.exists(cached_file):
+        def cached_stream():
+            with open(cached_file, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        
+        return StreamingResponse(
+            cached_stream(),
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": f'attachment; filename="{video_id}.{format_ext}"'}
+        )
+    
+    # Not cached - download from user's IP using local yt-dlp
+    tmpdir = tempfile.mkdtemp(prefix="dl_")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    try:
+        from yt_dlp import YoutubeDL
+        
+        ydl_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': format_ext,
+                'preferredquality': '192',
+            }],
+            'outtmpl': os.path.join(tmpdir, 'audio'),
+            'quiet': True,
+            'no_warnings': True,
+            'socket_timeout': 30,
+        }
+        
+        def download_sync():
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                return info.get('title', video_id)
+        
+        loop = asyncio.get_event_loop()
+        title = await loop.run_in_executor(None, download_sync)
+        
+        # Find downloaded file
+        files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
+        
+        if not files:
+            raise HTTPException(500, "Audio file not created")
+        
+        file_path = os.path.join(tmpdir, files[0])
+        filename = f"{title}.{format_ext}" if title else files[0]
+        filename = "".join(c for c in filename if ord(c) < 128 or c in ' -_.')
+        
+        # Cache the file for future requests
+        try:
+            import shutil
+            cached_path = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
+            shutil.copy2(file_path, cached_path)
+        except:
+            pass
+        
+        def file_stream():
+            try:
+                with open(file_path, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                try:
+                    os.remove(file_path)
+                    os.rmdir(tmpdir)
+                except:
+                    pass
+        
+        return StreamingResponse(
+            file_stream(),
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+        
+    except Exception as e:
+        raise HTTPException(500, f"Download failed: {str(e)}")
 
 
 async def convert_audio(input_file, output_format, tmpdir):

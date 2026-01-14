@@ -131,8 +131,8 @@ async def download(data: DownloadIn):
 @app.post("/download/direct")
 async def download_direct(data: DownloadIn):
     """
-    Direct download using external APIs that bypass YouTube bot detection.
-    Works on Render without IP blocking issues.
+    Direct download using multiple fallback methods.
+    Optimized for both localhost and Render deployment.
     """
     video_id = data.videoId
     format_ext = data.format
@@ -154,134 +154,141 @@ async def download_direct(data: DownloadIn):
             headers={"Content-Disposition": f'attachment; filename="{video_id}.{format_ext}"'}
         )
     
-    # Use external APIs to download (no direct YouTube access)
-    import httpx
     tmpdir = tempfile.mkdtemp(prefix="dl_")
+    url = f"https://www.youtube.com/watch?v={video_id}"
     
-    # Try Method 1: Cobalt API (reliable, free, no auth needed)
+    # Try Method 1: you-get (different extraction method, may bypass blocks)
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                "https://api.cobalt.tools/api/json",
-                json={
-                    "url": f"https://www.youtube.com/watch?v={video_id}",
-                    "vCodec": "h264",
-                    "vQuality": "720",
-                    "aFormat": "mp3" if format_ext == "mp3" else "best",
-                    "isAudioOnly": True
-                },
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json"
-                }
-            )
+        def youget_download():
+            import subprocess
+            output_file = os.path.join(tmpdir, f"{video_id}")
             
-            if response.status_code == 200:
-                result = response.json()
+            cmd = [
+                "you-get",
+                "-o", tmpdir,
+                "-O", video_id,
+                "--format=dash-flv720",
+                url
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            # Find downloaded file
+            files = [f for f in os.listdir(tmpdir) if not f.startswith('.')]
+            if files:
+                return os.path.join(tmpdir, files[0])
+            return None
+        
+        loop = asyncio.get_event_loop()
+        downloaded_file = await loop.run_in_executor(None, youget_download)
+        
+        if downloaded_file and os.path.exists(downloaded_file):
+            # Convert to desired format using ffmpeg
+            output_file = os.path.join(tmpdir, f"output.{format_ext}")
+            
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-i", downloaded_file, "-q:a", "0", "-map", "a", 
+                output_file, "-y",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.communicate()
+            
+            if os.path.exists(output_file):
+                # Cache it
+                try:
+                    import shutil
+                    shutil.copy2(output_file, cached_file)
+                except:
+                    pass
                 
-                if result.get("status") == "stream" or result.get("status") == "redirect":
-                    audio_url = result.get("url")
-                    
-                    if audio_url:
-                        # Download the audio file
-                        audio_response = await client.get(audio_url)
-                        
-                        if audio_response.status_code == 200:
-                            # Save to temp file
-                            temp_file = os.path.join(tmpdir, f"{video_id}.{format_ext}")
-                            with open(temp_file, "wb") as f:
-                                f.write(audio_response.content)
-                            
-                            # Cache it
-                            try:
-                                import shutil
-                                shutil.copy2(temp_file, cached_file)
-                            except:
-                                pass
-                            
-                            # Stream response
-                            def file_stream():
-                                try:
-                                    with open(temp_file, "rb") as f:
-                                        while True:
-                                            chunk = f.read(65536)
-                                            if not chunk:
-                                                break
-                                            yield chunk
-                                finally:
-                                    try:
-                                        os.remove(temp_file)
-                                        os.rmdir(tmpdir)
-                                    except:
-                                        pass
-                            
-                            return StreamingResponse(
-                                file_stream(),
-                                media_type="audio/mpeg",
-                                headers={"Content-Disposition": f'attachment; filename="{video_id}.{format_ext}"'}
-                            )
+                filename = f"{video_id}.{format_ext}"
+                
+                def file_stream():
+                    try:
+                        with open(output_file, "rb") as f:
+                            while True:
+                                chunk = f.read(65536)
+                                if not chunk:
+                                    break
+                                yield chunk
+                    finally:
+                        try:
+                            import shutil
+                            shutil.rmtree(tmpdir)
+                        except:
+                            pass
+                
+                return StreamingResponse(
+                    file_stream(),
+                    media_type="audio/mpeg",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                )
     except Exception as e:
-        print(f"Cobalt API failed: {e}")
+        print(f"you-get failed: {e}")
     
-    # Try Method 2: Y2Mate API alternative (loader.to)
+    # Try Method 2: pytube (often works better than yt-dlp on cloud)
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            # Get download links
-            response = await client.get(
-                f"https://ab.cococococ.com/ajax/download.php",
-                params={
-                    "copyright": "0",
-                    "format": "mp3" if format_ext == "mp3" else "m4a",
-                    "url": f"https://www.youtube.com/watch?v={video_id}",
-                    "api": "dfcb6d76f2f6a9894gjkege8a4ab232222"
-                }
-            )
+        def pytube_download():
+            from pytube import YouTube
+            yt = YouTube(url)
+            stream = yt.streams.filter(only_audio=True, file_extension='mp4').order_by('abr').desc().first()
             
-            if response.status_code == 200:
-                result = response.json()
+            if stream:
+                downloaded_file = stream.download(output_path=tmpdir, filename="audio.mp4")
+                return downloaded_file, yt.title
+            return None, None
+        
+        loop = asyncio.get_event_loop()
+        downloaded_file, title = await loop.run_in_executor(None, pytube_download)
+        
+        if downloaded_file and os.path.exists(downloaded_file):
+            # Convert to desired format using ffmpeg
+            output_file = os.path.join(tmpdir, f"output.{format_ext}")
+            
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-i", downloaded_file, "-q:a", "0", "-map", "a", 
+                output_file, "-y",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.communicate()
+            
+            if os.path.exists(output_file):
+                # Cache it
+                try:
+                    import shutil
+                    shutil.copy2(output_file, cached_file)
+                except:
+                    pass
                 
-                if result.get("success"):
-                    download_url = result.get("url")
-                    
-                    if download_url:
-                        audio_response = await client.get(download_url)
-                        
-                        if audio_response.status_code == 200:
-                            temp_file = os.path.join(tmpdir, f"{video_id}.{format_ext}")
-                            with open(temp_file, "wb") as f:
-                                f.write(audio_response.content)
-                            
-                            # Cache it
-                            try:
-                                import shutil
-                                shutil.copy2(temp_file, cached_file)
-                            except:
-                                pass
-                            
-                            def file_stream():
-                                try:
-                                    with open(temp_file, "rb") as f:
-                                        while True:
-                                            chunk = f.read(65536)
-                                            if not chunk:
-                                                break
-                                            yield chunk
-                                finally:
-                                    try:
-                                        os.remove(temp_file)
-                                        os.rmdir(tmpdir)
-                                    except:
-                                        pass
-                            
-                            return StreamingResponse(
-                                file_stream(),
-                                media_type="audio/mpeg",
-                                headers={"Content-Disposition": f'attachment; filename="{video_id}.{format_ext}"'}
-                            )
+                filename = f"{title}.{format_ext}" if title else f"{video_id}.{format_ext}"
+                filename = "".join(c for c in filename if ord(c) < 128 or c in ' -_.')
+                
+                def file_stream():
+                    try:
+                        with open(output_file, "rb") as f:
+                            while True:
+                                chunk = f.read(65536)
+                                if not chunk:
+                                    break
+                                yield chunk
+                    finally:
+                        try:
+                            import shutil
+                            shutil.rmtree(tmpdir)
+                        except:
+                            pass
+                
+                return StreamingResponse(
+                    file_stream(),
+                    media_type="audio/mpeg",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                )
     except Exception as e:
-        print(f"Y2Mate alternative failed: {e}")
+        print(f"pytube failed: {e}")
     
-    # Try Method 3: Local yt-dlp (works on localhost but may fail on Render)
+    # Try Method 2: yt-dlp with oauth and cookies from browser
     try:
         from yt_dlp import YoutubeDL
         
@@ -300,7 +307,7 @@ async def download_direct(data: DownloadIn):
         
         def download_sync():
             with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+                info = ydl.extract_info(url, download=True)
                 return info.get('title', video_id)
         
         loop = asyncio.get_event_loop()
@@ -330,8 +337,8 @@ async def download_direct(data: DownloadIn):
                             yield chunk
                 finally:
                     try:
-                        os.remove(file_path)
-                        os.rmdir(tmpdir)
+                        import shutil
+                        shutil.rmtree(tmpdir)
                     except:
                         pass
             
@@ -341,9 +348,16 @@ async def download_direct(data: DownloadIn):
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'}
             )
     except Exception as e:
-        print(f"yt-dlp fallback failed: {e}")
+        print(f"yt-dlp failed: {e}")
     
-    raise HTTPException(503, "All download methods failed. YouTube may be blocking requests. Try again later or pre-cache files.")
+    # Cleanup temp dir if all methods failed
+    try:
+        import shutil
+        shutil.rmtree(tmpdir)
+    except:
+        pass
+    
+    raise HTTPException(503, "Download failed. This service requires pre-cached files on Render. Please contact admin to cache this song.")
 
 
 async def convert_audio(input_file, output_format, tmpdir):

@@ -7,3 +7,4 @@ requests
 spotdl
 pytube
 httpx
+you-get

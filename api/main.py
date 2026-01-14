@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse, RedirectResponse
 from pydantic import BaseModel
 from ytmusicapi import YTMusic
 import subprocess
@@ -10,6 +10,8 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 import httpx
+import hmac
+import hashlib
 
 app = FastAPI()
 ytmusic = YTMusic()
@@ -30,7 +32,62 @@ class DownloadIn(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "local downloader running"}
+    return RedirectResponse(url="/top")
+
+
+@app.post("/webhook/deploy")
+async def github_webhook(request: Request):
+    """
+    GitHub webhook endpoint for auto-deployment.
+    Set this as webhook URL in GitHub repo settings.
+    """
+    # Optional: Verify GitHub signature (recommended for security)
+    webhook_secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+    if webhook_secret:
+        signature = request.headers.get("X-Hub-Signature-256", "")
+        body = await request.body()
+        expected_signature = "sha256=" + hmac.new(
+            webhook_secret.encode(),
+            body,
+            hashlib.sha256
+        ).hexdigest()
+        
+        if not hmac.compare_digest(signature, expected_signature):
+            raise HTTPException(403, "Invalid signature")
+    
+    payload = await request.json()
+    
+    # Only respond to push events on main/master branch
+    if payload.get("ref") in ["refs/heads/main", "refs/heads/master"]:
+        try:
+            # Get the repo directory
+            repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            
+            # Pull latest changes
+            result = subprocess.run(
+                ["git", "pull", "origin", "master"],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                # Restart the systemd service (if using systemd)
+                try:
+                    subprocess.run(
+                        ["sudo", "systemctl", "restart", "yuzone-api"],
+                        timeout=10
+                    )
+                    return {"status": "success", "message": "Pulled changes and restarted service"}
+                except Exception as e:
+                    return {"status": "partial", "message": f"Pulled changes but restart failed: {e}"}
+            else:
+                return {"status": "error", "message": result.stderr}
+        except Exception as e:
+            raise HTTPException(500, f"Deployment failed: {str(e)}")
+    
+    return {"status": "ignored", "message": "Not a push to master/main"}
 
 
 @app.post("/download")

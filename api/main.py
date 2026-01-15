@@ -826,6 +826,7 @@ async def spotify_playlist(request: SpotifyPlaylistRequest):
         artists_str = track.get("artist", "")
         artists = [a.strip() for a in artists_str.split(",") if a.strip()]
         thumbnail = None
+        duration = track.get("duration")
 
         query = f"{title} {artists[0] if artists else ''}".strip()
         video_id = None
@@ -851,7 +852,8 @@ async def spotify_playlist(request: SpotifyPlaylistRequest):
             "title": title,
             "authors": artists,
             "videoId": video_id,
-            "thumbnail": thumbnail
+            "thumbnail": thumbnail,
+            "duration": duration
         }
 
     enriched = await asyncio.gather(*(enrich(t) for t in (raw_tracks or [])))
@@ -957,11 +959,15 @@ async def youtube_playlist(request: YouTubePlaylistRequest):
             thumbnails = track.get("thumbnails", [])
             thumbnail = thumbnails[-1].get("url") if thumbnails else None
             
+            # Get duration (in seconds)
+            duration = track.get("duration")
+            
             tracks.append({
                 "title": title,
                 "authors": authors,
                 "videoId": video_id,
-                "thumbnail": thumbnail
+                "thumbnail": thumbnail,
+                "duration": duration
             })
         
         return {

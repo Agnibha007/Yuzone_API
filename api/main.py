@@ -814,6 +814,7 @@ async def spotify_playlist(request: SpotifyPlaylistRequest):
         raise HTTPException(500, f"Failed to fetch playlist: {e}")
 
     playlist_author = (info or {}).get("owner", {}).get("display_name") if info else "Spotify"
+    playlist_name = (info or {}).get("name") if info else "Unknown Playlist"
 
     # Parallelize YTMusic lookups with bounded concurrency
     search_sem = asyncio.Semaphore(8)
@@ -861,6 +862,7 @@ async def spotify_playlist(request: SpotifyPlaylistRequest):
 
     return {
         "playlistAuthor": playlist_author or "Spotify",
+        "playlistName": playlist_name,
         "trackCount": len(tracks),
         "tracks": tracks
     }

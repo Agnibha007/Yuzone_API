@@ -8,3 +8,4 @@ spotdl
 pytube
 httpx
 you-get
+beautifulsoup4

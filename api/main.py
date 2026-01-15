@@ -13,7 +13,7 @@ import httpx
 import hmac
 import hashlib
 import base64
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 # Load .local.env if it exists
 env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".local.env")
@@ -27,6 +27,12 @@ if os.path.exists(env_file):
 
 app = FastAPI()
 ytmusic = YTMusic()
+
+# Simple in-memory cache for Spotify client credentials tokens
+spotify_token_cache = {
+    "token": None,
+    "expires_at": 0.0  # unix timestamp
+}
 
 # allow at most 5 downloads running at the same time
 download_semaphore = asyncio.Semaphore(5)
@@ -640,99 +646,338 @@ def extract_spotify_playlist_id(link: str) -> str:
     """Extract playlist ID from Spotify URL or URI."""
     if not link:
         return ""
-    if link.startswith("spotify:playlist:"):
-        return link.split(":")[-1]
+    
+    # Handle different URL formats
+    if 'spotify.com' in link:
+        # Extract from web URL like: https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M
+        parsed = urlparse(link)
+        playlist_id = parsed.path.split('/')[-1]
+        # Remove query parameters if present
+        playlist_id = playlist_id.split('?')[0]
+        return playlist_id
+    elif 'spotify:playlist:' in link:
+        # Extract from URI like: spotify:playlist:37i9dQZF1DXcBWIGoYBM5M
+        return link.split(':')[-1]
+    else:
+        # Assume it's already just the ID
+        return link
+
+
+async def get_spotify_access_token(client_id: str, client_secret: str) -> str:
+    """Get Spotify access token using Client Credentials flow."""
+    import httpx
+    import base64
+    
+    # Encode credentials
+    credentials = f"{client_id}:{client_secret}"
+    encoded_credentials = base64.b64encode(credentials.encode()).decode()
+    
+    # Request token
+    headers = {
+        'Authorization': f'Basic {encoded_credentials}',
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    
+    data = {
+        'grant_type': 'client_credentials'
+    }
+    
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            'https://accounts.spotify.com/api/token',
+            headers=headers,
+            data=data
+        )
+
+        if response.status_code == 200:
+            token_data = response.json()
+            return token_data['access_token']
+
+        raise HTTPException(500, f"Error getting Spotify token: {response.status_code}")
+
+
+async def get_cached_spotify_access_token(client_id: str, client_secret: str) -> str:
+    """Return cached Spotify token if valid; otherwise fetch and cache a new one."""
+    now = datetime.utcnow().timestamp()
+    if spotify_token_cache["token"] and now < spotify_token_cache["expires_at"] - 60:
+        return spotify_token_cache["token"]
+
+    token = await get_spotify_access_token(client_id, client_secret)
+    # Token TTL is 3600s; refresh slightly early
+    spotify_token_cache["token"] = token
+    spotify_token_cache["expires_at"] = now + 3500
+    return token
+
+
+async def fetch_spotify_playlist(playlist_id: str, access_token: str) -> dict:
+    """Fetch all tracks from a Spotify playlist."""
+    import httpx
+    
+    headers = {
+        'Authorization': f'Bearer {access_token}'
+    }
+    
+    tracks = []
+    url = f'https://api.spotify.com/v1/playlists/{playlist_id}/tracks'
+    
+    async with httpx.AsyncClient() as client:
+        while url:
+            # Parameters to get specific fields and handle pagination
+            params = {
+                'limit': 50,  # Max items per request
+                'fields': 'items(added_at,track(id,name,artists(name),album(name,release_date,images),duration_ms,popularity,external_urls)),next'
+            }
+            
+            response = await client.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                for item in data['items']:
+                    track = item.get('track')
+                    if track:  # Some tracks might be None (removed/unavailable)
+                        artists = track.get('artists', [])
+                        album = track.get('album', {})
+                        
+                        tracks.append({
+                            'name': track.get('name', 'N/A'),
+                            'artists': [{'name': artist['name']} for artist in artists],
+                            'album': {
+                                'name': album.get('name', 'N/A'),
+                                'images': album.get('images', [])
+                            },
+                            'duration_ms': track.get('duration_ms', 0),
+                            'popularity': track.get('popularity', 0),
+                            'spotify_url': track.get('external_urls', {}).get('spotify', 'N/A'),
+                            'track_id': track.get('id', 'N/A')
+                        })
+                
+                # Check if there are more pages
+                url = data.get('next')
+            else:
+                raise HTTPException(500, f"Error fetching tracks: {response.status_code}")
+    
+    return tracks
+
+
+async def fetch_spotify_playlist_info(playlist_id: str, access_token: str):
+    """Fetch minimal playlist metadata (owner/name)."""
+    import httpx
+
+    url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
+    params = {"fields": "owner(display_name),name"}
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(url, headers=headers, params=params)
+        if resp.status_code != 200:
+            raise HTTPException(resp.status_code, f"Failed to fetch playlist info: {resp.text}")
+        return resp.json()
+
+
+class SpotifyPlaylistRequest(BaseModel):
+    link: str
+
+
+@app.post("/spotifyPlaylist")
+async def spotify_playlist(request: SpotifyPlaylistRequest):
+    """
+    Fetch Spotify playlist using `spotify-playlist-extractor` for URL parsing,
+    Spotify Web API for data, and enrich with YTMusic videoIds.
+    """
+    import spotify_extractor.cli as spe
+
+    link = request.link
+
+    # Use the extractor's parsing and token logic (no client credentials required here)
+    def extract():
+        playlist_id = spe.extract_playlist_id_from_url(link)
+        if not playlist_id:
+            raise HTTPException(400, "Invalid Spotify playlist link")
+
+        token = spe.get_access_token()
+        if not token:
+            raise HTTPException(500, "Failed to obtain Spotify access token")
+
+        info = spe.get_playlist_info(playlist_id, token)
+        tracks = spe.get_all_tracks_from_playlist(playlist_id, token)
+        return playlist_id, info, tracks
+
+    try:
+        playlist_id, info, raw_tracks = await asyncio.to_thread(extract)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Spotify fetch error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Failed to fetch playlist: {e}")
+
+    playlist_author = (info or {}).get("owner", {}).get("display_name") if info else "Spotify"
+
+    # Parallelize YTMusic lookups with bounded concurrency
+    search_sem = asyncio.Semaphore(8)
+
+    async def enrich(track: dict):
+        title = track.get("name")
+        if not title:
+            return None
+
+        artists_str = track.get("artist", "")
+        artists = [a.strip() for a in artists_str.split(",") if a.strip()]
+        thumbnail = None
+
+        query = f"{title} {artists[0] if artists else ''}".strip()
+        video_id = None
+
+        async with search_sem:
+            try:
+                yt_results = await asyncio.to_thread(
+                    ytmusic.search,
+                    query,
+                    filter="songs",
+                    limit=1
+                )
+                if yt_results:
+                    top = yt_results[0]
+                    video_id = top.get("videoId")
+                    thumbs = top.get("thumbnails") or []
+                    if thumbs:
+                        thumbnail = thumbs[-1].get("url") or thumbnail
+            except Exception as e:
+                print(f"YTMusic search failed for '{query}': {e}")
+
+        return {
+            "title": title,
+            "authors": artists,
+            "videoId": video_id,
+            "thumbnail": thumbnail
+        }
+
+    enriched = await asyncio.gather(*(enrich(t) for t in (raw_tracks or [])))
+    tracks = [t for t in enriched if t]
+
+    return {
+        "playlistAuthor": playlist_author or "Spotify",
+        "trackCount": len(tracks),
+        "tracks": tracks
+    }
+
+
+def extract_youtube_playlist_id(link: str) -> str:
+    """Extract playlist ID from YouTube/YouTube Music URL."""
+    if not link:
+        return ""
+    
+    # Handle various YouTube playlist URL formats
+    # https://www.youtube.com/playlist?list=PLxxxxxx
+    # https://music.youtube.com/playlist?list=PLxxxxxx
+    # https://youtu.be/xxxxxx?list=PLxxxxxx
+    
     parsed = urlparse(link)
-    path_parts = parsed.path.strip("/").split("/")
-    if len(path_parts) >= 2 and path_parts[0] == "playlist":
-        return path_parts[1]
+    query_params = parse_qs(parsed.query)
+    
+    if "list" in query_params:
+        return query_params["list"][0]
+    
     return ""
 
 
-async def fetch_spotify_playlist_with_spotdl(playlist_url: str) -> dict:
-    """Use spotdl to fetch playlist info without API auth."""
+class YouTubePlaylistRequest(BaseModel):
+    link: str
+
+
+@app.post("/youtubePlaylist")
+async def youtube_playlist(request: YouTubePlaylistRequest):
+    """
+    Fetch YouTube/YouTube Music playlist and return track details with videoIds.
+    
+    Request body:
+    {
+        "link": "youtube_playlist_url"
+    }
+    
+    Response:
+    {
+        "playlistAuthor": "Channel Name",
+        "playlistName": "Playlist Title",
+        "trackCount": 10,
+        "tracks": [
+            {
+                "title": "Song Name",
+                "authors": ["Artist Name"],
+                "videoId": "xxxxxxxxx",
+                "thumbnail": "https://..."
+            }
+        ]
+    }
+    """
+    link = request.link
+    playlist_id = extract_youtube_playlist_id(link)
+    
+    if not playlist_id:
+        raise HTTPException(400, "Invalid YouTube playlist link")
+    
+    print(f"Fetching YouTube playlist: {playlist_id}")
+    
     try:
-        from spotdl.client import Spotify
-        from spotdl.types.song import Song
+        # Fetch playlist data using ytmusicapi
+        playlist_data = await asyncio.to_thread(
+            ytmusic.get_playlist,
+            playlist_id,
+            limit=None  # Get all tracks
+        )
         
-        spotify = Spotify()
-        tracks = await asyncio.to_thread(spotify.get_playlist_tracks, playlist_url)
+        if not playlist_data:
+            raise HTTPException(404, "Playlist not found")
         
-        if not tracks:
-            raise HTTPException(400, "No tracks found in playlist")
+        playlist_name = playlist_data.get("title", "Unknown Playlist")
+        playlist_author = playlist_data.get("author", {}).get("name", "Unknown") if isinstance(playlist_data.get("author"), dict) else playlist_data.get("author", "Unknown")
+        playlist_tracks = playlist_data.get("tracks", [])
         
-        # Get playlist metadata from first track's context or use URL parsing
-        playlist_name = playlist_url.split("/")[-1].split("?")[0]
+        print(f"Playlist: {playlist_name} by {playlist_author}")
+        print(f"Total tracks: {len(playlist_tracks)}")
+        
+        tracks = []
+        for track in playlist_tracks:
+            if not track:
+                continue
+            
+            title = track.get("title", "Unknown")
+            video_id = track.get("videoId")
+            
+            # Extract artists
+            artists = track.get("artists", [])
+            if isinstance(artists, list):
+                authors = [artist.get("name", "") for artist in artists if isinstance(artist, dict) and artist.get("name")]
+            else:
+                authors = []
+            
+            # Get thumbnail
+            thumbnails = track.get("thumbnails", [])
+            thumbnail = thumbnails[-1].get("url") if thumbnails else None
+            
+            tracks.append({
+                "title": title,
+                "authors": authors,
+                "videoId": video_id,
+                "thumbnail": thumbnail
+            })
         
         return {
-            "name": playlist_name,
-            "owner": {"display_name": "Spotify User"},
-            "tracks": {
-                "total": len(tracks),
-                "items": [{"track": {
-                    "name": track.name,
-                    "artists": [{"name": artist} for artist in track.artists],
-                    "album": {"images": [{"url": track.cover_url}] if track.cover_url else []}
-                }} for track in tracks]
-            }
+            "playlistAuthor": playlist_author,
+            "playlistName": playlist_name,
+            "trackCount": len(tracks),
+            "tracks": tracks
         }
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(500, f"Failed to fetch playlist with spotdl: {str(e)}")
-
-
-@app.get("/spotifyPlaylist")
-async def spotify_playlist(link: str):
-    playlist_id = extract_spotify_playlist_id(link)
-    if not playlist_id:
-        raise HTTPException(400, "Invalid Spotify playlist link")
-
-    playlist_data = await fetch_spotify_playlist_with_spotdl(link)
-
-    tracks_blob = (playlist_data.get("tracks") or {})
-    items = tracks_blob.get("items") or []
-    track_count = tracks_blob.get("total") or len(items)
-    playlist_author = (playlist_data.get("owner") or {}).get("display_name") or "Unknown"
-
-    tracks = []
-    for item in items:
-        track = item.get("track") or {}
-        title = track.get("name")
-        if not title:
-            continue
-        authors = [a.get("name") for a in track.get("artists", []) if a.get("name")]
-        album_images = (track.get("album") or {}).get("images") or []
-        cover = album_images[0].get("url") if album_images else None
-
-        query = " ".join([title] + (authors[:1] if authors else []))
-        video_id = None
-        thumb = cover
-        try:
-            yt_results = await asyncio.to_thread(
-                ytmusic.search,
-                query,
-                **{"filter": "songs", "limit": 1},
-            )
-            if yt_results:
-                top = yt_results[0]
-                video_id = top.get("videoId")
-                thumbs = top.get("thumbnails") or []
-                if thumbs:
-                    thumb = thumbs[-1].get("url") or thumb
-        except Exception:
-            pass
-
-        tracks.append({
-            "title": title,
-            "authors": authors,
-            "videoId": video_id,
-            "thumbnail": thumb,
-        })
-
-    return {
-        "playlistAuthor": playlist_author,
-        "trackCount": track_count,
-        "tracks": tracks,
-    }
+        print(f"Error fetching playlist: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Failed to fetch playlist: {str(e)}")
     
 @app.get("/search")
 def search(q: str):

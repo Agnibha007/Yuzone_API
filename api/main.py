@@ -1014,6 +1014,65 @@ def search(q: str):
     return formatted_results
 
 
+class LyricsRequest(BaseModel):
+    videoId: str
+
+
+@app.post("/lyrics")
+async def get_lyrics(request: LyricsRequest):
+    """
+    Fetch lyrics for a song by videoId.
+    
+    Request body:
+    {
+        "videoId": "xxxxxxxxx"
+    }
+    
+    Response:
+    {
+        "lyrics": "...",
+        "source": "YouTube Music"
+    }
+    """
+    video_id = request.videoId
+    
+    if not video_id:
+        raise HTTPException(400, "videoId is required")
+    
+    try:
+        # Get watch playlist which contains lyrics info
+        watch_data = await asyncio.to_thread(
+            ytmusic.get_watch_playlist,
+            video_id
+        )
+        
+        if not watch_data or "lyrics" not in watch_data:
+            raise HTTPException(404, "Lyrics not available for this song")
+        
+        lyrics_browse_id = watch_data["lyrics"]
+        
+        # Fetch actual lyrics
+        lyrics_data = await asyncio.to_thread(
+            ytmusic.get_lyrics,
+            lyrics_browse_id
+        )
+        
+        if not lyrics_data or "lyrics" not in lyrics_data:
+            raise HTTPException(404, "Lyrics not found")
+        
+        return {
+            "lyrics": lyrics_data["lyrics"],
+            "source": lyrics_data.get("source", "YouTube Music")
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching lyrics: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Failed to fetch lyrics: {str(e)}")
+
 
 @app.get("/top")
 def top_songs():

@@ -816,6 +816,11 @@ async def spotify_playlist(request: SpotifyPlaylistRequest):
     playlist_author = (info or {}).get("owner", {}).get("display_name") if info else "Spotify"
     playlist_name = (info or {}).get("name") if info else "Unknown Playlist"
 
+    # Debug: log first track to see available fields
+    if raw_tracks:
+        print(f"DEBUG: First track keys: {list(raw_tracks[0].keys())}")
+        print(f"DEBUG: First track: {raw_tracks[0]}")
+
     # Parallelize YTMusic lookups with bounded concurrency
     search_sem = asyncio.Semaphore(8)
 
@@ -827,7 +832,7 @@ async def spotify_playlist(request: SpotifyPlaylistRequest):
         artists_str = track.get("artist", "")
         artists = [a.strip() for a in artists_str.split(",") if a.strip()]
         thumbnail = None
-        duration = track.get("duration")
+        duration = None
 
         query = f"{title} {artists[0] if artists else ''}".strip()
         video_id = None
@@ -843,6 +848,8 @@ async def spotify_playlist(request: SpotifyPlaylistRequest):
                 if yt_results:
                     top = yt_results[0]
                     video_id = top.get("videoId")
+                    # Get duration from YTMusic (in seconds)
+                    duration = top.get("duration")
                     thumbs = top.get("thumbnails") or []
                     if thumbs:
                         thumbnail = thumbs[-1].get("url") or thumbnail

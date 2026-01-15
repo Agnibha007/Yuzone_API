@@ -9,3 +9,4 @@ pytube
 httpx
 you-get
 beautifulsoup4
+spotify-playlist-extractor

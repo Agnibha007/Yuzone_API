@@ -1101,12 +1101,25 @@ def format_search_results(items, item_type):
     """Format search results based on item type"""
     formatted_results = []
     
+    # Ensure items is a list
+    if not isinstance(items, list):
+        return formatted_results
+    
     for item in items:
+        if not isinstance(item, dict):
+            continue
+            
         if item_type == "song":
+            # Format artists safely
+            artists = item.get("artists", [])
+            artist_names = []
+            if isinstance(artists, list):
+                artist_names = [artist.get("name") for artist in artists if isinstance(artist, dict) and artist.get("name")]
+            
             formatted_results.append({
                 "type": "song",
                 "title": item.get("title"),
-                "artists": [artist.get("name") for artist in item.get("artists", [])],
+                "artists": artist_names,
                 "duration": item.get("duration"),
                 "thumbnail": item.get("thumbnails", [{}])[-1].get("url") if item.get("thumbnails") else None,
                 "videoId": item.get("videoId")
@@ -1130,10 +1143,16 @@ def format_search_results(items, item_type):
                 "browseId": item.get("browseId")
             })
         elif item_type == "album":
+            # Format artists safely
+            artists = item.get("artists", [])
+            artist_names = []
+            if isinstance(artists, list):
+                artist_names = [artist.get("name") for artist in artists if isinstance(artist, dict) and artist.get("name")]
+            
             formatted_results.append({
                 "type": "album",
                 "title": item.get("title"),
-                "artists": [artist.get("name") for artist in item.get("artists", [])],
+                "artists": artist_names,
                 "year": item.get("year"),
                 "thumbnail": item.get("thumbnails", [{}])[-1].get("url") if item.get("thumbnails") else None,
                 "browseId": item.get("browseId")

@@ -1047,23 +1047,23 @@ def search(q: str, type: str = "all"):
     Example:
     /search?q=Na%20re%20na&type=songs
     """
-    # Validate type parameter
-    valid_types = ["all", "songs", "artists", "albums"]
-    if type not in valid_types:
-        raise HTTPException(400, f"Invalid type. Must be one of: {', '.join(valid_types)}")
-    
-    # Map type to ytmusicapi filter parameter
-    filter_map = {
-        "all": None,  # No filter for "all"
-        "songs": "songs",
-        "artists": "artists",
-        "albums": "albums"
-    }
-    
-    filter_param = filter_map[type]
-    
-    # Perform search
     try:
+        # Validate type parameter
+        valid_types = ["all", "songs", "artists", "albums"]
+        if type not in valid_types:
+            raise HTTPException(400, f"Invalid type. Must be one of: {', '.join(valid_types)}")
+        
+        # Map type to ytmusicapi filter parameter
+        filter_map = {
+            "all": None,  # No filter for "all"
+            "songs": "songs",
+            "artists": "artists",
+            "albums": "albums"
+        }
+        
+        filter_param = filter_map[type]
+        
+        # Perform search
         if filter_param:
             results = ytmusic.search(q, filter=filter_param, limit=20)
         else:
@@ -1076,25 +1076,30 @@ def search(q: str, type: str = "all"):
                 "artists": artists,
                 "albums": albums
             }
+
+        if not results:
+            raise HTTPException(404, "No results found")
+
+        # Format results based on type
+        if type == "all":
+            return {
+                "songs": format_search_results(results.get("songs", []), "song"),
+                "artists": format_search_results(results.get("artists", []), "artist"),
+                "albums": format_search_results(results.get("albums", []), "album")
+            }
+        elif type == "songs":
+            return format_search_results(results, "song")
+        elif type == "artists":
+            return format_search_results(results, "artist")
+        elif type == "albums":
+            return format_search_results(results, "album")
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"Search error: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(500, f"Search failed: {str(e)}")
-
-    if not results:
-        raise HTTPException(404, "No results found")
-
-    # Format results based on type
-    if type == "all":
-        return {
-            "songs": format_search_results(results.get("songs", []), "song"),
-            "artists": format_search_results(results.get("artists", []), "artist"),
-            "albums": format_search_results(results.get("albums", []), "album")
-        }
-    elif type == "songs":
-        return format_search_results(results, "song")
-    elif type == "artists":
-        return format_search_results(results, "artist")
-    elif type == "albums":
-        return format_search_results(results, "album")
 
 
 def format_search_results(items, item_type):

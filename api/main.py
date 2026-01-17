@@ -46,6 +46,28 @@ CACHE_MANIFEST = os.path.join(CACHE_DIR, "manifest.json")
 class DownloadIn(BaseModel):
     videoId: str
     format: str = "mp3"
+    quality: int = 2  # 1=low, 2=medium, 3=high
+
+
+def get_quality_settings(quality: int) -> dict:
+    """
+    Get FFmpeg quality settings based on quality level.
+    
+    1 = Low quality (low bandwidth, 96 kbps)
+    2 = Medium quality (128 kbps) - default
+    3 = High quality (320 kbps)
+    """
+    quality_map = {
+        1: {"bitrate": "96k", "vbr": "9"},  # Low quality
+        2: {"bitrate": "128k", "vbr": "6"},  # Medium quality
+        3: {"bitrate": "320k", "vbr": "0"}   # High quality
+    }
+    
+    # Default to medium if invalid quality value
+    if quality not in quality_map:
+        quality = 2
+    
+    return quality_map[quality]
 
 
 @app.get("/")
@@ -113,6 +135,11 @@ async def download(data: DownloadIn):
     async with download_semaphore:
         video_id = data.videoId
         format_ext = data.format
+        quality = data.quality if hasattr(data, 'quality') else 2
+        
+        # Validate quality
+        if quality not in [1, 2, 3]:
+            raise HTTPException(400, "Quality must be 1 (low), 2 (medium), or 3 (high)")
         
         # Check cache first
         cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
@@ -145,22 +172,20 @@ async def download(data: DownloadIn):
         try:
             from yt_dlp import YoutubeDL
             
-            # Get ffmpeg location from bin/ directory
-            bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
-            ffmpeg_path = os.path.join(bin_dir, 'ffmpeg')
+            # Get quality settings
+            quality_settings = get_quality_settings(quality)
             
             ydl_opts = {
                 'format': 'bestaudio[ext=m4a]/bestaudio/best',
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': format_ext,
-                    'preferredquality': '192',
+                    'preferredquality': quality_settings['bitrate'],
                 }],
                 'outtmpl': os.path.join(tmpdir, 'audio'),
                 'quiet': True,
                 'no_warnings': True,
                 'socket_timeout': 30,
-                'ffmpeg_location': bin_dir,
             }
             
             def download_sync():
@@ -225,9 +250,19 @@ async def download_direct(data: DownloadIn):
     """
     Direct download using multiple fallback methods.
     Optimized for both localhost and Render deployment.
+    
+    Parameters:
+    - videoId: YouTube video ID (required)
+    - format: Audio format (default: mp3)
+    - quality: 1=low (96kbps), 2=medium (128kbps), 3=high (320kbps)
     """
     video_id = data.videoId
     format_ext = data.format
+    quality = data.quality if hasattr(data, 'quality') else 2
+    
+    # Validate quality
+    if quality not in [1, 2, 3]:
+        raise HTTPException(400, "Quality must be 1 (low), 2 (medium), or 3 (high)")
     
     # Check cache first
     cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
@@ -480,22 +515,20 @@ async def download_direct(data: DownloadIn):
     try:
         from yt_dlp import YoutubeDL
         
-        # Get ffmpeg location from bin/ directory
-        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
-        ffmpeg_path = os.path.join(bin_dir, 'ffmpeg')
+        # Get quality settings
+        quality_settings = get_quality_settings(quality)
         
         ydl_opts = {
             'format': 'bestaudio[ext=m4a]/bestaudio/best',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': format_ext,
-                'preferredquality': '192',
+                'preferredquality': quality_settings['bitrate'],
             }],
             'outtmpl': os.path.join(tmpdir, 'audio'),
             'quiet': True,
             'no_warnings': True,
             'socket_timeout': 30,
-            'ffmpeg_location': bin_dir,
         }
         
         def download_sync():
@@ -995,23 +1028,199 @@ async def youtube_playlist(request: YouTubePlaylistRequest):
         raise HTTPException(500, f"Failed to fetch playlist: {str(e)}")
     
 @app.get("/search")
-def search(q: str):
-    results = ytmusic.search(q, filter="songs", limit=20)
+def search(q: str, type: str = "all"):
+    """
+    Search for songs, artists, or albums.
+    
+    Parameters:
+    - q: Search query (required)
+    - type: Filter type - "all", "songs", "artists", or "albums" (default: "all")
+    
+    Example:
+    /search?q=Na%20re%20na&type=songs
+    """
+    # Validate type parameter
+    valid_types = ["all", "songs", "artists", "albums"]
+    if type not in valid_types:
+        raise HTTPException(400, f"Invalid type. Must be one of: {', '.join(valid_types)}")
+    
+    # Map type to ytmusicapi filter parameter
+    filter_map = {
+        "all": None,  # No filter for "all"
+        "songs": "songs",
+        "artists": "artists",
+        "albums": "albums"
+    }
+    
+    filter_param = filter_map[type]
+    
+    # Perform search
+    try:
+        if filter_param:
+            results = ytmusic.search(q, filter=filter_param, limit=20)
+        else:
+            # For "all", get results from multiple filter types
+            songs = ytmusic.search(q, filter="songs", limit=10)
+            artists = ytmusic.search(q, filter="artists", limit=10)
+            albums = ytmusic.search(q, filter="albums", limit=10)
+            results = {
+                "songs": songs,
+                "artists": artists,
+                "albums": albums
+            }
+    except Exception as e:
+        raise HTTPException(500, f"Search failed: {str(e)}")
 
     if not results:
         raise HTTPException(404, "No results found")
 
-    formatted_results = []
-    for item in results:
-        formatted_results.append({
-            "title": item.get("title"),
-            "artists": [artist.get("name") for artist in item.get("artists", [])],
-            "duration": item.get("duration"),
-            "thumbnail": item.get("thumbnails", [{}])[-1].get("url"),
-            "videoId": item.get("videoId")
-        })
+    # Format results based on type
+    if type == "all":
+        return {
+            "songs": format_search_results(results.get("songs", []), "song"),
+            "artists": format_search_results(results.get("artists", []), "artist"),
+            "albums": format_search_results(results.get("albums", []), "album")
+        }
+    elif type == "songs":
+        return format_search_results(results, "song")
+    elif type == "artists":
+        return format_search_results(results, "artist")
+    elif type == "albums":
+        return format_search_results(results, "album")
 
+
+def format_search_results(items, item_type):
+    """Format search results based on item type"""
+    formatted_results = []
+    
+    for item in items:
+        if item_type == "song":
+            formatted_results.append({
+                "type": "song",
+                "title": item.get("title"),
+                "artists": [artist.get("name") for artist in item.get("artists", [])],
+                "duration": item.get("duration"),
+                "thumbnail": item.get("thumbnails", [{}])[-1].get("url") if item.get("thumbnails") else None,
+                "videoId": item.get("videoId")
+            })
+        elif item_type == "artist":
+            # Try to get artist name from various fields
+            artist_name = item.get("title") or item.get("name") or item.get("subtitle")
+            
+            # If name is still not available, try to fetch from browseId
+            if not artist_name and item.get("browseId"):
+                try:
+                    artist_info = ytmusic.get_artist(item.get("browseId"))
+                    artist_name = artist_info.get("name")
+                except Exception as e:
+                    print(f"Failed to fetch artist info for {item.get('browseId')}: {e}")
+            
+            formatted_results.append({
+                "type": "artist",
+                "name": artist_name,
+                "thumbnail": item.get("thumbnails", [{}])[-1].get("url") if item.get("thumbnails") else None,
+                "browseId": item.get("browseId")
+            })
+        elif item_type == "album":
+            formatted_results.append({
+                "type": "album",
+                "title": item.get("title"),
+                "artists": [artist.get("name") for artist in item.get("artists", [])],
+                "year": item.get("year"),
+                "thumbnail": item.get("thumbnails", [{}])[-1].get("url") if item.get("thumbnails") else None,
+                "browseId": item.get("browseId")
+            })
+    
     return formatted_results
+
+
+@app.get("/artist/{browseId}")
+def get_artist_details(browseId: str):
+    """
+    Get detailed information about an artist by browseId.
+    
+    Example:
+    /artist/UCDxKh1gFWeYsqePvgVzmPoQ
+    
+    Returns: artist name, description, thumbnail, top songs, albums, singles, etc.
+    """
+    try:
+        artist_info = ytmusic.get_artist(browseId)
+        
+        if not artist_info:
+            raise HTTPException(404, "Artist not found")
+        
+        # Format the response
+        response = {
+            "name": artist_info.get("name"),
+            "description": artist_info.get("description"),
+            "thumbnail": artist_info.get("thumbnails", [{}])[-1].get("url") if artist_info.get("thumbnails") else None,
+            "browseId": browseId
+        }
+        
+        # Add top songs if available
+        if artist_info.get("songs"):
+            response["topSongs"] = format_search_results(artist_info.get("songs", []), "song")
+        
+        # Add albums if available
+        if artist_info.get("albums"):
+            response["albums"] = format_search_results(artist_info.get("albums", []), "album")
+        
+        # Add singles if available
+        if artist_info.get("singles"):
+            response["singles"] = format_search_results(artist_info.get("singles", []), "album")
+        
+        return response
+        
+    except Exception as e:
+        print(f"Error fetching artist details: {e}")
+        raise HTTPException(500, f"Failed to fetch artist details: {str(e)}")
+
+
+@app.get("/album/{browseId}")
+def get_album_details(browseId: str):
+    """
+    Get detailed information about an album by browseId.
+    
+    Example:
+    /album/MPREb_XUWTmZUXJVt
+    
+    Returns: title, artists, tracks, year, release date, thumbnail, etc.
+    """
+    try:
+        album_info = ytmusic.get_album(browseId)
+        
+        if not album_info:
+            raise HTTPException(404, "Album not found")
+        
+        # Format the response
+        response = {
+            "title": album_info.get("title"),
+            "artists": [{"name": artist.get("name"), "browseId": artist.get("id")} 
+                       for artist in album_info.get("artists", [])],
+            "year": album_info.get("year"),
+            "releaseDate": album_info.get("releaseDate"),
+            "thumbnail": album_info.get("thumbnails", [{}])[-1].get("url") if album_info.get("thumbnails") else None,
+            "browseId": browseId
+        }
+        
+        # Add tracks if available
+        if album_info.get("tracks"):
+            response["tracks"] = format_search_results(album_info.get("tracks", []), "song")
+        
+        # Add description/subtitle if available
+        if album_info.get("description"):
+            response["description"] = album_info.get("description")
+        
+        # Add duration if available
+        if album_info.get("duration"):
+            response["duration"] = album_info.get("duration")
+        
+        return response
+        
+    except Exception as e:
+        print(f"Error fetching album details: {e}")
+        raise HTTPException(500, f"Failed to fetch album details: {str(e)}")
 
 
 class LyricsRequest(BaseModel):

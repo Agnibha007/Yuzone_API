@@ -172,6 +172,9 @@ async def download(data: DownloadIn):
         try:
             from yt_dlp import YoutubeDL
             
+            # Get ffmpeg location from bin/ directory
+            bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
+            
             # Get quality settings
             quality_settings = get_quality_settings(quality)
             
@@ -186,6 +189,7 @@ async def download(data: DownloadIn):
                 'quiet': True,
                 'no_warnings': True,
                 'socket_timeout': 30,
+                'ffmpeg_location': bin_dir,
             }
             
             def download_sync():
@@ -515,6 +519,9 @@ async def download_direct(data: DownloadIn):
     try:
         from yt_dlp import YoutubeDL
         
+        # Get ffmpeg location from bin/ directory
+        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
+        
         # Get quality settings
         quality_settings = get_quality_settings(quality)
         
@@ -529,6 +536,7 @@ async def download_direct(data: DownloadIn):
             'quiet': True,
             'no_warnings': True,
             'socket_timeout': 30,
+            'ffmpeg_location': bin_dir,
         }
         
         def download_sync():

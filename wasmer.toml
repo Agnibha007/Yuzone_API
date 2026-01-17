@@ -1,0 +1,24 @@
+# Wasmer App configuration for Yuzone_API
+
+[package]
+name = "yuzone-api"
+version = "0.1.0"
+description = "FastAPI YouTube Music API wrapper"
+
+[env]
+# Default port Wasmer will pass to the app
+PORT = "8080"
+
+[dependencies]
+# Use the Python runner (3.11.x). Wasmer resolves this from its registry.
+"python/python" = "3.11.*"
+
+[python]
+# Ensure app dependencies are installed in the Python environment
+requirements = "requirements.txt"
+
+[[command]]
+# Start the FastAPI server
+name = "start"
+runner = "python"
+cmd = "uvicorn api.main:app --host 0.0.0.0 --port ${PORT}"

@@ -1172,9 +1172,10 @@ def get_artist_details(browseId: str):
     Get detailed information about an artist by browseId.
     
     Example:
-    /artist/UCDxKh1gFWeYsqePvgVzmPoQ
+    /artist/UCPC0L1d253x-KuMNwa05TpA
     
     Returns: artist name, description, thumbnail, top songs, albums, singles, etc.
+    Note: browseId should be an artist catalog ID, not a channel ID (UC...).
     """
     try:
         artist_info = ytmusic.get_artist(browseId)

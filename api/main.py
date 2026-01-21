@@ -1256,6 +1256,52 @@ def get_album_details(browseId: str):
         raise HTTPException(500, f"Failed to fetch album details: {str(e)}")
 
 
+@app.get("/album")
+def get_album_songs(browseId: str):
+    """
+    Get all songs from an album by browseId via query parameter.
+    
+    Example:
+    GET /album?browseId=MPREb_XUWTmZUXJVt
+    
+    Returns: List of all songs in the album with their details
+    """
+    if not browseId:
+        raise HTTPException(400, "browseId query parameter is required")
+    
+    try:
+        album_info = ytmusic.get_album(browseId)
+        
+        if not album_info:
+            raise HTTPException(404, "Album not found")
+        
+        # Return all tracks from the album
+        tracks = album_info.get("tracks", [])
+        
+        if not tracks:
+            return {
+                "browseId": browseId,
+                "title": album_info.get("title"),
+                "songs": []
+            }
+        
+        # Format the tracks
+        formatted_tracks = format_search_results(tracks, "song")
+        
+        return {
+            "browseId": browseId,
+            "title": album_info.get("title"),
+            "artists": [{"name": artist.get("name"), "browseId": artist.get("id")} 
+                       for artist in album_info.get("artists", [])],
+            "songs": formatted_tracks,
+            "totalSongs": len(formatted_tracks)
+        }
+        
+    except Exception as e:
+        print(f"Error fetching album songs: {e}")
+        raise HTTPException(500, f"Failed to fetch album songs: {str(e)}")
+
+
 class LyricsRequest(BaseModel):
     videoId: str
 

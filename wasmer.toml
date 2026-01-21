@@ -7,18 +7,18 @@ description = "FastAPI YouTube Music API wrapper"
 
 [env]
 # Default port Wasmer will pass to the app
-PORT = "8080"
+PORT = "8000"
 
 [dependencies]
 # Use the Python runner (3.11.x). Wasmer resolves this from its registry.
-"python/python" = "3.11.*"
+"python/python" = "^3.11"
 
-[python]
-# Ensure app dependencies are installed in the Python environment
-requirements = "requirements.txt"
+[fs]
+"/app" = "."
 
 [[command]]
 # Start the FastAPI server
 name = "start"
-runner = "python"
-cmd = "uvicorn api.main:app --host 0.0.0.0 --port ${PORT}"
+runner = "https://webc.org/runner/wasi"
+module = "python/python:python"
+args = ["-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "$PORT"]

@@ -1288,6 +1288,11 @@ def get_album_songs(browseId: str):
         # Format the tracks
         formatted_tracks = format_search_results(tracks, "song")
         
+        # Add YouTube thumbnail for songs that don't have one
+        for song in formatted_tracks:
+            if not song.get("thumbnail") and song.get("videoId"):
+                song["thumbnail"] = f"https://i.ytimg.com/vi/{song['videoId']}/mqdefault.jpg"
+        
         return {
             "browseId": browseId,
             "title": album_info.get("title"),

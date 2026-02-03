@@ -29,8 +29,11 @@ Your `/download` and `/download/direct` endpoints now have enhanced handling for
 
 ### 4. **Better Format Selection**
 
-- Falls back through multiple format options: `bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best`
+- Intelligent fallback: `bestaudio[ext=m4a] → bestaudio[ext=webm] → bestaudio → best[ext=mp4] → best[ext=webm] → best`
+- Tries audio-only formats first (faster, smaller file size)
+- Falls back to video+audio if audio-only unavailable
 - Handles various video encoding formats
+- FFmpegExtractAudio automatically extracts audio from video+audio streams
 
 ### 5. **Extractor Configuration**
 

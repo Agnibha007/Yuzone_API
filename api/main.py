@@ -78,7 +78,8 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
     cookies_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cookies.txt')
     
     opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
+        # More flexible format selection - tries audio-only first, then combined formats
+        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best[ext=webm]/best',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': format_ext,

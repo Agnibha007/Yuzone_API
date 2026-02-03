@@ -45,8 +45,8 @@ CACHE_MANIFEST = os.path.join(CACHE_DIR, "manifest.json")
 
 class DownloadIn(BaseModel):
     videoId: str
-    format: str = "mp3"
     quality: int = 2  # 1=low, 2=medium, 3=high
+    # Format is always MP3 - no other formats supported
 
 
 def get_quality_settings(quality: int) -> dict:
@@ -189,7 +189,7 @@ async def github_webhook(request: Request):
 async def download(data: DownloadIn):
     async with download_semaphore:
         video_id = data.videoId
-        format_ext = data.format
+        format_ext = "mp3"  # Always MP3 format
         quality = data.quality if hasattr(data, 'quality') else 2
         
         # Validate quality
@@ -310,11 +310,12 @@ async def download_direct(data: DownloadIn):
     
     Parameters:
     - videoId: YouTube video ID (required)
-    - format: Audio format (default: mp3)
     - quality: 1=low (96kbps), 2=medium (128kbps), 3=high (320kbps)
+    
+    Output format is always MP3.
     """
     video_id = data.videoId
-    format_ext = data.format
+    format_ext = "mp3"  # Always MP3 format
     quality = data.quality if hasattr(data, 'quality') else 2
     
     # Validate quality

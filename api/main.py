@@ -79,7 +79,7 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
     
     opts = {
         # More flexible format selection - tries audio-only first, then combined formats
-        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best[ext=webm]/best',
+        'format': 'bestaudio/best',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': format_ext,
@@ -108,9 +108,10 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
         'skip_unavailable_fragments': True,
         'nocheckcertificate': True,
         'prefer_insecure': False,
+        # Don't skip any extractors - let yt-dlp handle challenge solving
         'extractor_args': {
             'youtube': {
-                'skip': ['hls', 'dash'],
+                'player_client': ['android', 'web'],
                 'lang': ['en'],
             }
         },

@@ -29,17 +29,27 @@ Your `/download` and `/download/direct` endpoints now have enhanced handling for
 
 ### 4. **Better Format Selection**
 
-- Intelligent fallback: `bestaudio[ext=m4a] → bestaudio[ext=webm] → bestaudio → best[ext=mp4] → best[ext=webm] → best`
-- Tries audio-only formats first (faster, smaller file size)
+- Simplified format: `bestaudio/best` with maximum compatibility
+- Automatically selects best available audio format
 - Falls back to video+audio if audio-only unavailable
-- Handles various video encoding formats
-- FFmpegExtractAudio automatically extracts audio from video+audio streams
+- FFmpegExtractAudio automatically extracts audio from any stream
 
 ### 5. **Extractor Configuration**
 
-- Skips HLS and DASH (older/slower formats)
+- Uses Android and Web player clients for better compatibility
+- Bypasses YouTube's "n" parameter challenge protection
 - Language preference set to English
 - Optimized for audio extraction
+
+### 6. **JavaScript Runtime Support**
+
+YouTube's "n" parameter challenge requires JavaScript execution. yt-dlp handles this automatically if you have Node.js or Deno installed.
+
+**Already installed on your system:**
+
+- Deno (you mentioned it was downloaded alongside yt-dlp)
+
+This allows yt-dlp to solve YouTube's JavaScript challenges automatically.
 
 ## How to refresh cookies (if needed)
 
@@ -78,17 +88,37 @@ These commands:
 
 The endpoints now properly distinguish between different error types:
 
-- **403 Forbidden**: Indicates YouTube blocked the request (bad cookies, throttling)
-  - Solution: Refresh cookies.txt
+- **403 Forbidden**: YouTube blocked the request (expired cookies, throttling)
+  - Solution: Refresh cookies.txt using Edge Cookie Editor
 - **429 Rate Limited**: YouTube is rate-limiting requests
-  - Solution: Wait and retry later, or use /download/direct endpoint with RapidAPI
+  - Solution: Wait and retry later, or use /download/direct endpoint
+- **"n challenge solving failed"**: JavaScript runtime issue
+  - Already handled: Your Deno installation allows yt-dlp to solve these challenges
+  - Code now uses `player_client: ['android', 'web']` to bypass challenges
+- **"Requested format is not available"**: Format selection issue
+  - Fixed: Now uses flexible `bestaudio/best` format
+- **Other Errors**: Extraction or network issues
+  - Check logs for specific error messages
 
-- **500+ Server Errors**: Other extraction issues
-  - Check logs for detailed error messages
+## Troubleshooting
 
-## Testing
+### If you still get "n challenge solving failed":
 
-Try your downloads again. If you still get 403 errors:
+1. **Verify Deno is accessible** (already installed):
+
+   ```bash
+   deno --version
+   ```
+
+2. **Update yt-dlp to latest version**:
+
+   ```bash
+   pip install -U yt-dlp
+   ```
+
+3. **The code now uses Android player client** which bypasses most challenges
+
+### If downloads fail:
 
 1. First, try the `/download/direct` endpoint (uses multiple fallback methods)
 2. Check if cookies.txt is valid and not expired

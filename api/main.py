@@ -70,6 +70,59 @@ def get_quality_settings(quality: int) -> dict:
     return quality_map[quality]
 
 
+def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int) -> dict:
+    """
+    Generate optimized yt-dlp options to handle 403 errors and bot detection.
+    """
+    quality_settings = get_quality_settings(quality)
+    cookies_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cookies.txt')
+    
+    opts = {
+        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': format_ext,
+            'preferredquality': quality_settings['bitrate'],
+            'nopostoverwrites': False,
+        }],
+        'outtmpl': os.path.join(tmpdir, '%(id)s'),
+        'quiet': False,
+        'no_warnings': False,
+        'socket_timeout': 30,
+        'ffmpeg_location': bin_dir,
+        'keepvideo': False,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        },
+        'concurrent_fragment_downloads': 5,
+        'fragment_retries': 3,
+        'file_access_retries': 10,
+        'retries': 10,
+        'skip_unavailable_fragments': True,
+        'nocheckcertificate': True,
+        'prefer_insecure': False,
+        'extractor_args': {
+            'youtube': {
+                'skip': ['hls', 'dash'],
+                'lang': ['en'],
+            }
+        },
+    }
+    
+    # Add cookies if available
+    if os.path.exists(cookies_file):
+        opts['cookiefile'] = cookies_file
+    
+    return opts
+
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/top")
@@ -175,32 +228,8 @@ async def download(data: DownloadIn):
             # Get ffmpeg location from bin/ directory
             bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
             
-            # Get quality settings
-            quality_settings = get_quality_settings(quality)
-            
-            # yt-dlp latest guidelines configuration
-            ydl_opts = {
-                'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': format_ext,
-                    'preferredquality': quality_settings['bitrate'],
-                    'nopostoverwrites': False,
-                }],
-                'outtmpl': os.path.join(tmpdir, '%(id)s'),
-                'quiet': False,
-                'no_warnings': False,
-                'socket_timeout': 30,
-                'socket_local_addr': None,
-                'ffmpeg_location': bin_dir,
-                'keepvideo': False,
-                'progress_hooks': [],
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                },
-                'concurrent_fragment_downloads': 5,
-                'fragment_retries': 3,
-            }
+            # Get optimized yt-dlp options
+            ydl_opts = get_yt_dlp_options(tmpdir, bin_dir, format_ext, quality)
             
             def download_sync():
                 with YoutubeDL(ydl_opts) as ydl:
@@ -208,7 +237,13 @@ async def download(data: DownloadIn):
                         info = ydl.extract_info(url, download=True)
                         return info.get('title', video_id)
                     except Exception as e:
-                        raise HTTPException(500, f"yt-dlp extraction failed: {str(e)}")
+                        error_msg = str(e)
+                        if '403' in error_msg:
+                            raise HTTPException(403, f"YouTube blocked the request (403). Try using the /download/direct endpoint or ensure cookies are set up.")
+                        elif '429' in error_msg:
+                            raise HTTPException(429, f"Rate limited by YouTube. Please wait before trying again.")
+                        else:
+                            raise HTTPException(500, f"yt-dlp extraction failed: {error_msg}")
             
             loop = asyncio.get_event_loop()
             title = await loop.run_in_executor(None, download_sync)
@@ -538,31 +573,8 @@ async def download_direct(data: DownloadIn):
         # Get ffmpeg location from bin/ directory
         bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
         
-        # Get quality settings
-        quality_settings = get_quality_settings(quality)
-        
-        # yt-dlp latest guidelines configuration
-        ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': format_ext,
-                'preferredquality': quality_settings['bitrate'],
-                'nopostoverwrites': False,
-            }],
-            'outtmpl': os.path.join(tmpdir, '%(id)s'),
-            'quiet': False,
-            'no_warnings': False,
-            'socket_timeout': 30,
-            'socket_local_addr': None,
-            'ffmpeg_location': bin_dir,
-            'keepvideo': False,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            },
-            'concurrent_fragment_downloads': 5,
-            'fragment_retries': 3,
-        }
+        # Get optimized yt-dlp options
+        ydl_opts = get_yt_dlp_options(tmpdir, bin_dir, format_ext, quality)
         
         def download_sync():
             with YoutubeDL(ydl_opts) as ydl:

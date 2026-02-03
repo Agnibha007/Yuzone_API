@@ -178,24 +178,37 @@ async def download(data: DownloadIn):
             # Get quality settings
             quality_settings = get_quality_settings(quality)
             
+            # yt-dlp latest guidelines configuration
             ydl_opts = {
-                'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': format_ext,
                     'preferredquality': quality_settings['bitrate'],
+                    'nopostoverwrites': False,
                 }],
-                'outtmpl': os.path.join(tmpdir, 'audio'),
-                'quiet': True,
-                'no_warnings': True,
+                'outtmpl': os.path.join(tmpdir, '%(id)s'),
+                'quiet': False,
+                'no_warnings': False,
                 'socket_timeout': 30,
+                'socket_local_addr': None,
                 'ffmpeg_location': bin_dir,
+                'keepvideo': False,
+                'progress_hooks': [],
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                },
+                'concurrent_fragment_downloads': 5,
+                'fragment_retries': 3,
             }
             
             def download_sync():
                 with YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    return info.get('title', video_id)
+                    try:
+                        info = ydl.extract_info(url, download=True)
+                        return info.get('title', video_id)
+                    except Exception as e:
+                        raise HTTPException(500, f"yt-dlp extraction failed: {str(e)}")
             
             loop = asyncio.get_event_loop()
             title = await loop.run_in_executor(None, download_sync)
@@ -204,7 +217,7 @@ async def download(data: DownloadIn):
             files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
             
             if not files:
-                raise HTTPException(500, "Audio file not created")
+                raise HTTPException(500, "Audio file not created after postprocessing")
             
             file_path = os.path.join(tmpdir, files[0])
             filename = f"{title}.{format_ext}" if title else files[0]
@@ -215,7 +228,8 @@ async def download(data: DownloadIn):
                 import shutil
                 cached_path = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
                 shutil.copy2(file_path, cached_path)
-            except:
+            except Exception as cache_error:
+                # Log but don't fail if caching fails
                 pass
             
             def file_stream():
@@ -230,7 +244,7 @@ async def download(data: DownloadIn):
                     try:
                         os.remove(file_path)
                         os.rmdir(tmpdir)
-                    except:
+                    except Exception:
                         pass
             
             file_size = os.path.getsize(file_path)
@@ -245,6 +259,8 @@ async def download(data: DownloadIn):
                 }
             )
             
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(500, f"Download failed: {str(e)}")
 
@@ -515,7 +531,7 @@ async def download_direct(data: DownloadIn):
     except Exception as e:
         print(f"pytube failed: {e}")
     
-    # Try Method 2: yt-dlp with oauth and cookies from browser
+    # Try Method 3: yt-dlp with latest best practices
     try:
         from yt_dlp import YoutubeDL
         
@@ -525,24 +541,36 @@ async def download_direct(data: DownloadIn):
         # Get quality settings
         quality_settings = get_quality_settings(quality)
         
+        # yt-dlp latest guidelines configuration
         ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio/best',
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': format_ext,
                 'preferredquality': quality_settings['bitrate'],
+                'nopostoverwrites': False,
             }],
-            'outtmpl': os.path.join(tmpdir, 'audio'),
-            'quiet': True,
-            'no_warnings': True,
+            'outtmpl': os.path.join(tmpdir, '%(id)s'),
+            'quiet': False,
+            'no_warnings': False,
             'socket_timeout': 30,
+            'socket_local_addr': None,
             'ffmpeg_location': bin_dir,
+            'keepvideo': False,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            'concurrent_fragment_downloads': 5,
+            'fragment_retries': 3,
         }
         
         def download_sync():
             with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return info.get('title', video_id)
+                try:
+                    info = ydl.extract_info(url, download=True)
+                    return info.get('title', video_id)
+                except Exception as e:
+                    raise HTTPException(500, f"yt-dlp extraction failed: {str(e)}")
         
         loop = asyncio.get_event_loop()
         title = await loop.run_in_executor(None, download_sync)
@@ -558,7 +586,7 @@ async def download_direct(data: DownloadIn):
             try:
                 import shutil
                 shutil.copy2(file_path, cached_file)
-            except:
+            except Exception:
                 pass
             
             def file_stream():
@@ -573,7 +601,7 @@ async def download_direct(data: DownloadIn):
                     try:
                         import shutil
                         shutil.rmtree(tmpdir)
-                    except:
+                    except Exception:
                         pass
             
             file_size = os.path.getsize(file_path)
@@ -587,6 +615,8 @@ async def download_direct(data: DownloadIn):
                     "Accept-Ranges": "bytes"
                 }
             )
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"yt-dlp failed: {e}")
     

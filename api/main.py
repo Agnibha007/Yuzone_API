@@ -1546,8 +1546,39 @@ async def download_playlist(data: PlaylistDownloadIn):
                 cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
                 
                 if os.path.exists(cached_file):
-                    # Copy from cache
-                    dest_path = os.path.join(playlist_tmpdir, f"{idx:03d}_{video_id}.{format_ext}")
+                    # For cached files, we need to get the original title
+                    # Try to extract title from YoutubeDL info
+                    tmpdir_info = tempfile.mkdtemp(prefix="info_")
+                    url = f"https://www.youtube.com/watch?v={video_id}"
+                    title = video_id
+                    
+                    try:
+                        from yt_dlp import YoutubeDL
+                        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
+                        ydl_opts = get_yt_dlp_options(tmpdir_info, bin_dir, format_ext, quality)
+                        ydl_opts['skip_download'] = True  # Only get info, don't download
+                        
+                        def get_title():
+                            with YoutubeDL(ydl_opts) as ydl:
+                                try:
+                                    info = ydl.extract_info(url, download=False)
+                                    return info.get('title', video_id)
+                                except:
+                                    return video_id
+                        
+                        loop = asyncio.get_event_loop()
+                        title = await loop.run_in_executor(None, get_title)
+                    except:
+                        title = video_id
+                    finally:
+                        try:
+                            shutil.rmtree(tmpdir_info)
+                        except:
+                            pass
+                    
+                    # Sanitize filename
+                    safe_title = "".join(c for c in title if ord(c) < 128 or c in ' -_.')
+                    dest_path = os.path.join(playlist_tmpdir, f"{idx:03d}_{safe_title}.{format_ext}")
                     shutil.copy2(cached_file, dest_path)
                     downloaded_count += 1
                 else:
@@ -1587,7 +1618,9 @@ async def download_playlist(data: PlaylistDownloadIn):
                         
                         if files:
                             file_path = os.path.join(tmpdir, files[0])
-                            dest_path = os.path.join(playlist_tmpdir, f"{idx:03d}_{video_id}.{format_ext}")
+                            # Sanitize filename for safe filesystem usage
+                            safe_title = "".join(c for c in title if ord(c) < 128 or c in ' -_.')
+                            dest_path = os.path.join(playlist_tmpdir, f"{idx:03d}_{safe_title}.{format_ext}")
                             shutil.copy2(file_path, dest_path)
                             
                             # Also cache for future requests
@@ -1616,8 +1649,11 @@ async def download_playlist(data: PlaylistDownloadIn):
             files = sorted([f for f in os.listdir(playlist_tmpdir) if f.endswith(f".{format_ext}")])
             for file in files:
                 file_path = os.path.join(playlist_tmpdir, file)
-                # Remove the numeric prefix when adding to ZIP
-                arcname = file.split('_', 1)[1] if '_' in file else file
+                # Remove the numeric prefix when adding to ZIP (keep original title)
+                if '_' in file:
+                    arcname = file.split('_', 1)[1]  # Remove "001_" prefix, keep "Song Title.mp3"
+                else:
+                    arcname = file
                 zipf.write(file_path, arcname)
         
         # Read ZIP file and stream it

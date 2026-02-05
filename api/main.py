@@ -49,6 +49,12 @@ class DownloadIn(BaseModel):
     # Format is always MP3 - no other formats supported
 
 
+class PlaylistDownloadIn(BaseModel):
+    videoIds: list
+    quality: int = 2  # 1=low, 2=medium, 3=high
+    # Format is always MP3 - no other formats supported
+
+
 def get_quality_settings(quality: int) -> dict:
     """
     Get FFmpeg quality settings based on quality level.
@@ -1491,5 +1497,162 @@ def top_songs():
         raise HTTPException(404, "No chart data found")
 
     return {"tracks": top}
+
+
+@app.post("/download/playlist")
+async def download_playlist(data: PlaylistDownloadIn):
+    """
+    Download an entire playlist as a ZIP file containing all MP3 files.
+    
+    Request body:
+    {
+        "videoIds": ["video_id_1", "video_id_2", "video_id_3"],
+        "quality": 2
+    }
+    
+    quality: 1=low (96kbps), 2=medium (128kbps, default), 3=high (320kbps)
+    """
+    import zipfile
+    import shutil
+    from io import BytesIO
+    
+    video_ids = data.videoIds
+    quality = data.quality if hasattr(data, 'quality') else 2
+    format_ext = "mp3"
+    
+    # Validate quality
+    if quality not in [1, 2, 3]:
+        raise HTTPException(400, "Quality must be 1 (low), 2 (medium), or 3 (high)")
+    
+    # Validate video IDs
+    if not video_ids or not isinstance(video_ids, list):
+        raise HTTPException(400, "videoIds must be a non-empty list")
+    
+    if len(video_ids) > 100:
+        raise HTTPException(400, "Maximum 100 videos per playlist allowed")
+    
+    # Create temporary directory for playlist downloads
+    playlist_tmpdir = tempfile.mkdtemp(prefix="playlist_")
+    zip_path = os.path.join(playlist_tmpdir, "playlist.zip")
+    
+    try:
+        downloaded_count = 0
+        failed_videos = []
+        
+        # Download each video
+        for idx, video_id in enumerate(video_ids, 1):
+            try:
+                # Check cache first
+                cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
+                
+                if os.path.exists(cached_file):
+                    # Copy from cache
+                    dest_path = os.path.join(playlist_tmpdir, f"{idx:03d}_{video_id}.{format_ext}")
+                    shutil.copy2(cached_file, dest_path)
+                    downloaded_count += 1
+                else:
+                    # Download fresh
+                    tmpdir = tempfile.mkdtemp(prefix="dl_")
+                    url = f"https://www.youtube.com/watch?v={video_id}"
+                    
+                    try:
+                        from yt_dlp import YoutubeDL
+                        
+                        # Get ffmpeg location from bin/ directory
+                        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
+                        
+                        # Get optimized yt-dlp options
+                        ydl_opts = get_yt_dlp_options(tmpdir, bin_dir, format_ext, quality)
+                        
+                        def download_sync():
+                            with YoutubeDL(ydl_opts) as ydl:
+                                try:
+                                    info = ydl.extract_info(url, download=True)
+                                    return info.get('title', video_id)
+                                except Exception as e:
+                                    error_msg = str(e)
+                                    if '403' in error_msg or '429' in error_msg:
+                                        return None
+                                    raise Exception(f"yt-dlp extraction failed: {error_msg}")
+                        
+                        loop = asyncio.get_event_loop()
+                        title = await loop.run_in_executor(None, download_sync)
+                        
+                        if title is None:
+                            failed_videos.append(video_id)
+                            continue
+                        
+                        # Find downloaded file
+                        files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
+                        
+                        if files:
+                            file_path = os.path.join(tmpdir, files[0])
+                            dest_path = os.path.join(playlist_tmpdir, f"{idx:03d}_{video_id}.{format_ext}")
+                            shutil.copy2(file_path, dest_path)
+                            
+                            # Also cache for future requests
+                            try:
+                                cached_path = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
+                                shutil.copy2(file_path, cached_path)
+                            except Exception:
+                                pass
+                            
+                            downloaded_count += 1
+                    finally:
+                        try:
+                            shutil.rmtree(tmpdir)
+                        except Exception:
+                            pass
+                            
+            except Exception as e:
+                print(f"Failed to download video {video_id}: {e}")
+                failed_videos.append(video_id)
+        
+        if downloaded_count == 0:
+            raise HTTPException(500, "Failed to download any videos from the playlist")
+        
+        # Create ZIP file with all downloaded songs
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            files = sorted([f for f in os.listdir(playlist_tmpdir) if f.endswith(f".{format_ext}")])
+            for file in files:
+                file_path = os.path.join(playlist_tmpdir, file)
+                # Remove the numeric prefix when adding to ZIP
+                arcname = file.split('_', 1)[1] if '_' in file else file
+                zipf.write(file_path, arcname)
+        
+        # Read ZIP file and stream it
+        zip_size = os.path.getsize(zip_path)
+        
+        def zip_stream():
+            try:
+                with open(zip_path, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                try:
+                    shutil.rmtree(playlist_tmpdir)
+                except Exception:
+                    pass
+        
+        return StreamingResponse(
+            zip_stream(),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="playlist.zip"',
+                "Content-Length": str(zip_size),
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            shutil.rmtree(playlist_tmpdir)
+        except Exception:
+            pass
+        raise HTTPException(500, f"Playlist download failed: {str(e)}")
 
 #icon, song name, singers

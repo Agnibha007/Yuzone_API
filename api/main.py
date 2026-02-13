@@ -45,14 +45,8 @@ CACHE_MANIFEST = os.path.join(CACHE_DIR, "manifest.json")
 
 class DownloadIn(BaseModel):
     videoId: str
+    format: str = "mp3"
     quality: int = 2  # 1=low, 2=medium, 3=high
-    # Format is always MP3 - no other formats supported
-
-
-class PlaylistDownloadIn(BaseModel):
-    videoIds: list
-    quality: int = 2  # 1=low, 2=medium, 3=high
-    # Format is always MP3 - no other formats supported
 
 
 def get_quality_settings(quality: int) -> dict:
@@ -74,61 +68,6 @@ def get_quality_settings(quality: int) -> dict:
         quality = 2
     
     return quality_map[quality]
-
-
-def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int) -> dict:
-    """
-    Generate optimized yt-dlp options to handle 403 errors and bot detection.
-    """
-    quality_settings = get_quality_settings(quality)
-    cookies_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cookies.txt')
-    
-    opts = {
-        # More flexible format selection - tries audio-only first, then combined formats
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': format_ext,
-            'preferredquality': quality_settings['bitrate'],
-            'nopostoverwrites': False,
-        }],
-        'outtmpl': os.path.join(tmpdir, '%(id)s'),
-        'quiet': False,
-        'no_warnings': False,
-        'socket_timeout': 30,
-        'ffmpeg_location': bin_dir,
-        'keepvideo': False,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        },
-        'concurrent_fragment_downloads': 5,
-        'fragment_retries': 3,
-        'file_access_retries': 10,
-        'retries': 10,
-        'skip_unavailable_fragments': True,
-        'nocheckcertificate': True,
-        'prefer_insecure': False,
-        # Don't skip any extractors - let yt-dlp handle challenge solving
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'web'],
-                'lang': ['en'],
-            }
-        },
-    }
-    
-    # Add cookies if available
-    if os.path.exists(cookies_file):
-        opts['cookiefile'] = cookies_file
-    
-    return opts
-
 
 
 @app.get("/")
@@ -195,7 +134,7 @@ async def github_webhook(request: Request):
 async def download(data: DownloadIn):
     async with download_semaphore:
         video_id = data.videoId
-        format_ext = "mp3"  # Always MP3 format
+        format_ext = data.format
         quality = data.quality if hasattr(data, 'quality') else 2
         
         # Validate quality
@@ -236,22 +175,27 @@ async def download(data: DownloadIn):
             # Get ffmpeg location from bin/ directory
             bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
             
-            # Get optimized yt-dlp options
-            ydl_opts = get_yt_dlp_options(tmpdir, bin_dir, format_ext, quality)
+            # Get quality settings
+            quality_settings = get_quality_settings(quality)
+            
+            ydl_opts = {
+                'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': format_ext,
+                    'preferredquality': quality_settings['bitrate'],
+                }],
+                'outtmpl': os.path.join(tmpdir, 'audio'),
+                'quiet': True,
+                'no_warnings': True,
+                'socket_timeout': 30,
+                'ffmpeg_location': bin_dir,
+            }
             
             def download_sync():
                 with YoutubeDL(ydl_opts) as ydl:
-                    try:
-                        info = ydl.extract_info(url, download=True)
-                        return info.get('title', video_id)
-                    except Exception as e:
-                        error_msg = str(e)
-                        if '403' in error_msg:
-                            raise HTTPException(403, f"YouTube blocked the request (403). Try using the /download/direct endpoint or ensure cookies are set up.")
-                        elif '429' in error_msg:
-                            raise HTTPException(429, f"Rate limited by YouTube. Please wait before trying again.")
-                        else:
-                            raise HTTPException(500, f"yt-dlp extraction failed: {error_msg}")
+                    info = ydl.extract_info(url, download=True)
+                    return info.get('title', video_id)
             
             loop = asyncio.get_event_loop()
             title = await loop.run_in_executor(None, download_sync)
@@ -260,7 +204,7 @@ async def download(data: DownloadIn):
             files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
             
             if not files:
-                raise HTTPException(500, "Audio file not created after postprocessing")
+                raise HTTPException(500, "Audio file not created")
             
             file_path = os.path.join(tmpdir, files[0])
             filename = f"{title}.{format_ext}" if title else files[0]
@@ -271,8 +215,7 @@ async def download(data: DownloadIn):
                 import shutil
                 cached_path = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
                 shutil.copy2(file_path, cached_path)
-            except Exception as cache_error:
-                # Log but don't fail if caching fails
+            except:
                 pass
             
             def file_stream():
@@ -287,7 +230,7 @@ async def download(data: DownloadIn):
                     try:
                         os.remove(file_path)
                         os.rmdir(tmpdir)
-                    except Exception:
+                    except:
                         pass
             
             file_size = os.path.getsize(file_path)
@@ -302,8 +245,6 @@ async def download(data: DownloadIn):
                 }
             )
             
-        except HTTPException:
-            raise
         except Exception as e:
             raise HTTPException(500, f"Download failed: {str(e)}")
 
@@ -316,12 +257,11 @@ async def download_direct(data: DownloadIn):
     
     Parameters:
     - videoId: YouTube video ID (required)
+    - format: Audio format (default: mp3)
     - quality: 1=low (96kbps), 2=medium (128kbps), 3=high (320kbps)
-    
-    Output format is always MP3.
     """
     video_id = data.videoId
-    format_ext = "mp3"  # Always MP3 format
+    format_ext = data.format
     quality = data.quality if hasattr(data, 'quality') else 2
     
     # Validate quality
@@ -575,23 +515,34 @@ async def download_direct(data: DownloadIn):
     except Exception as e:
         print(f"pytube failed: {e}")
     
-    # Try Method 3: yt-dlp with latest best practices
+    # Try Method 2: yt-dlp with oauth and cookies from browser
     try:
         from yt_dlp import YoutubeDL
         
         # Get ffmpeg location from bin/ directory
         bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
         
-        # Get optimized yt-dlp options
-        ydl_opts = get_yt_dlp_options(tmpdir, bin_dir, format_ext, quality)
+        # Get quality settings
+        quality_settings = get_quality_settings(quality)
+        
+        ydl_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': format_ext,
+                'preferredquality': quality_settings['bitrate'],
+            }],
+            'outtmpl': os.path.join(tmpdir, 'audio'),
+            'quiet': True,
+            'no_warnings': True,
+            'socket_timeout': 30,
+            'ffmpeg_location': bin_dir,
+        }
         
         def download_sync():
             with YoutubeDL(ydl_opts) as ydl:
-                try:
-                    info = ydl.extract_info(url, download=True)
-                    return info.get('title', video_id)
-                except Exception as e:
-                    raise HTTPException(500, f"yt-dlp extraction failed: {str(e)}")
+                info = ydl.extract_info(url, download=True)
+                return info.get('title', video_id)
         
         loop = asyncio.get_event_loop()
         title = await loop.run_in_executor(None, download_sync)
@@ -607,7 +558,7 @@ async def download_direct(data: DownloadIn):
             try:
                 import shutil
                 shutil.copy2(file_path, cached_file)
-            except Exception:
+            except:
                 pass
             
             def file_stream():
@@ -622,7 +573,7 @@ async def download_direct(data: DownloadIn):
                     try:
                         import shutil
                         shutil.rmtree(tmpdir)
-                    except Exception:
+                    except:
                         pass
             
             file_size = os.path.getsize(file_path)
@@ -636,8 +587,6 @@ async def download_direct(data: DownloadIn):
                     "Accept-Ranges": "bytes"
                 }
             )
-    except HTTPException:
-        raise
     except Exception as e:
         print(f"yt-dlp failed: {e}")
     
@@ -1497,198 +1446,5 @@ def top_songs():
         raise HTTPException(404, "No chart data found")
 
     return {"tracks": top}
-
-
-@app.post("/download/playlist")
-async def download_playlist(data: PlaylistDownloadIn):
-    """
-    Download an entire playlist as a ZIP file containing all MP3 files.
-    
-    Request body:
-    {
-        "videoIds": ["video_id_1", "video_id_2", "video_id_3"],
-        "quality": 2
-    }
-    
-    quality: 1=low (96kbps), 2=medium (128kbps, default), 3=high (320kbps)
-    """
-    import zipfile
-    import shutil
-    from io import BytesIO
-    
-    video_ids = data.videoIds
-    quality = data.quality if hasattr(data, 'quality') else 2
-    format_ext = "mp3"
-    
-    # Validate quality
-    if quality not in [1, 2, 3]:
-        raise HTTPException(400, "Quality must be 1 (low), 2 (medium), or 3 (high)")
-    
-    # Validate video IDs
-    if not video_ids or not isinstance(video_ids, list):
-        raise HTTPException(400, "videoIds must be a non-empty list")
-    
-    if len(video_ids) > 100:
-        raise HTTPException(400, "Maximum 100 videos per playlist allowed")
-    
-    # Create temporary directory for playlist downloads
-    playlist_tmpdir = tempfile.mkdtemp(prefix="playlist_")
-    zip_path = os.path.join(playlist_tmpdir, "playlist.zip")
-    
-    try:
-        downloaded_count = 0
-        failed_videos = []
-        
-        # Download each video
-        for idx, video_id in enumerate(video_ids, 1):
-            try:
-                # Check cache first
-                cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
-                
-                if os.path.exists(cached_file):
-                    # For cached files, we need to get the original title
-                    # Try to extract title from YoutubeDL info
-                    tmpdir_info = tempfile.mkdtemp(prefix="info_")
-                    url = f"https://www.youtube.com/watch?v={video_id}"
-                    title = video_id
-                    
-                    try:
-                        from yt_dlp import YoutubeDL
-                        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
-                        ydl_opts = get_yt_dlp_options(tmpdir_info, bin_dir, format_ext, quality)
-                        ydl_opts['skip_download'] = True  # Only get info, don't download
-                        
-                        def get_title():
-                            with YoutubeDL(ydl_opts) as ydl:
-                                try:
-                                    info = ydl.extract_info(url, download=False)
-                                    return info.get('title', video_id)
-                                except:
-                                    return video_id
-                        
-                        loop = asyncio.get_event_loop()
-                        title = await loop.run_in_executor(None, get_title)
-                    except:
-                        title = video_id
-                    finally:
-                        try:
-                            shutil.rmtree(tmpdir_info)
-                        except:
-                            pass
-                    
-                    # Sanitize filename
-                    safe_title = "".join(c for c in title if ord(c) < 128 or c in ' -_.')
-                    dest_path = os.path.join(playlist_tmpdir, f"{idx:03d}_{safe_title}.{format_ext}")
-                    shutil.copy2(cached_file, dest_path)
-                    downloaded_count += 1
-                else:
-                    # Download fresh
-                    tmpdir = tempfile.mkdtemp(prefix="dl_")
-                    url = f"https://www.youtube.com/watch?v={video_id}"
-                    
-                    try:
-                        from yt_dlp import YoutubeDL
-                        
-                        # Get ffmpeg location from bin/ directory
-                        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin')
-                        
-                        # Get optimized yt-dlp options
-                        ydl_opts = get_yt_dlp_options(tmpdir, bin_dir, format_ext, quality)
-                        
-                        def download_sync():
-                            with YoutubeDL(ydl_opts) as ydl:
-                                try:
-                                    info = ydl.extract_info(url, download=True)
-                                    return info.get('title', video_id)
-                                except Exception as e:
-                                    error_msg = str(e)
-                                    if '403' in error_msg or '429' in error_msg:
-                                        return None
-                                    raise Exception(f"yt-dlp extraction failed: {error_msg}")
-                        
-                        loop = asyncio.get_event_loop()
-                        title = await loop.run_in_executor(None, download_sync)
-                        
-                        if title is None:
-                            failed_videos.append(video_id)
-                            continue
-                        
-                        # Find downloaded file
-                        files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
-                        
-                        if files:
-                            file_path = os.path.join(tmpdir, files[0])
-                            # Sanitize filename for safe filesystem usage
-                            safe_title = "".join(c for c in title if ord(c) < 128 or c in ' -_.')
-                            dest_path = os.path.join(playlist_tmpdir, f"{idx:03d}_{safe_title}.{format_ext}")
-                            shutil.copy2(file_path, dest_path)
-                            
-                            # Also cache for future requests
-                            try:
-                                cached_path = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
-                                shutil.copy2(file_path, cached_path)
-                            except Exception:
-                                pass
-                            
-                            downloaded_count += 1
-                    finally:
-                        try:
-                            shutil.rmtree(tmpdir)
-                        except Exception:
-                            pass
-                            
-            except Exception as e:
-                print(f"Failed to download video {video_id}: {e}")
-                failed_videos.append(video_id)
-        
-        if downloaded_count == 0:
-            raise HTTPException(500, "Failed to download any videos from the playlist")
-        
-        # Create ZIP file with all downloaded songs
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            files = sorted([f for f in os.listdir(playlist_tmpdir) if f.endswith(f".{format_ext}")])
-            for file in files:
-                file_path = os.path.join(playlist_tmpdir, file)
-                # Remove the numeric prefix when adding to ZIP (keep original title)
-                if '_' in file:
-                    arcname = file.split('_', 1)[1]  # Remove "001_" prefix, keep "Song Title.mp3"
-                else:
-                    arcname = file
-                zipf.write(file_path, arcname)
-        
-        # Read ZIP file and stream it
-        zip_size = os.path.getsize(zip_path)
-        
-        def zip_stream():
-            try:
-                with open(zip_path, "rb") as f:
-                    while True:
-                        chunk = f.read(65536)
-                        if not chunk:
-                            break
-                        yield chunk
-            finally:
-                try:
-                    shutil.rmtree(playlist_tmpdir)
-                except Exception:
-                    pass
-        
-        return StreamingResponse(
-            zip_stream(),
-            media_type="application/zip",
-            headers={
-                "Content-Disposition": f'attachment; filename="playlist.zip"',
-                "Content-Length": str(zip_size),
-            }
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        try:
-            shutil.rmtree(playlist_tmpdir)
-        except Exception:
-            pass
-        raise HTTPException(500, f"Playlist download failed: {str(e)}")
 
 #icon, song name, singers

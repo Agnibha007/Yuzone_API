@@ -1346,7 +1346,7 @@ async def fetch_lrclib_lyrics(artist_name: str, track_name: str) -> Optional[dic
     return data
 
 
-@app.post("/lyrics")
+@app.post("/1")
 async def get_lyrics(request: LyricsRequest):
     video_id = request.videoId.strip() if request.videoId else None
     artist_name = request.artistName.strip() if request.artistName else None

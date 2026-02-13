@@ -3,3 +3,4 @@
 app.yaml
 Dockerfile
 wasmer.toml
+API_USAGE.md

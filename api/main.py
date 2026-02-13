@@ -111,7 +111,7 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
         'concurrent_fragment_downloads': 4,
         'fragment_retries': 5,
         'file_access_retries': 15,
-        'retries': {'http': 10, 'fragment': 10},
+        'retries': 10,
         'skip_unavailable_fragments': True,
         'nocheckcertificate': True,
         'prefer_insecure': False,

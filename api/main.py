@@ -14,7 +14,6 @@ import hmac
 import hashlib
 import base64
 from urllib.parse import urlparse, parse_qs
-from typing import Optional
 
 # Load .local.env if it exists
 env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".local.env")
@@ -100,31 +99,35 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
         'ffmpeg_location': bin_dir,
         'keepvideo': False,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate',
-            'DNT': '1',
-            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
             'Upgrade-Insecure-Requests': '1',
         },
-        'concurrent_fragment_downloads': 5,
-        'fragment_retries': 3,
-        'file_access_retries': 10,
-        'retries': 10,
+        'concurrent_fragment_downloads': 4,
+        'fragment_retries': 5,
+        'file_access_retries': 15,
+        'retries': {'http': 10, 'fragment': 10},
         'skip_unavailable_fragments': True,
         'nocheckcertificate': True,
         'prefer_insecure': False,
-        # Don't skip any extractors - let yt-dlp handle challenge solving
+        'allow_unplayable_formats': True,
+        'geo_bypass': True,
+        'geo_bypass_country': 'US',
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
+                'player_client': ['android', 'web', 'mweb'],
                 'lang': ['en'],
+                'skip': ['dash', 'hls'],
             }
         },
     }
     
-    # Add cookies if available
+    # Add cookies if available - critical for reducing 403 errors
     if os.path.exists(cookies_file):
         opts['cookiefile'] = cookies_file
     
@@ -1360,77 +1363,31 @@ def get_album_songs(browseId: str):
 
 
 class LyricsRequest(BaseModel):
-    videoId: Optional[str] = None
-    artistName: Optional[str] = None
-    trackName: Optional[str] = None
-
-
-async def fetch_lrclib_lyrics(artist_name: str, track_name: str) -> Optional[dict]:
-    params = {
-        "artist_name": artist_name,
-        "track_name": track_name
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get("https://lrclib.net/api/get", params=params)
-    except httpx.RequestError as exc:
-        print(f"LRCLib request error: {exc}")
-        return None
-
-    if response.status_code == 404:
-        return None
-
-    if response.status_code != 200:
-        print(f"LRCLib unexpected status: {response.status_code}")
-        return None
-
-    try:
-        data = response.json()
-    except ValueError:
-        print("LRCLib returned invalid JSON")
-        return None
-
-    if not data.get("syncedLyrics"):
-        return None
-
-    return data
+    videoId: str
 
 
 @app.post("/lyrics")
 async def get_lyrics(request: LyricsRequest):
-    video_id = request.videoId.strip() if request.videoId else None
-    artist_name = request.artistName.strip() if request.artistName else None
-    track_name = request.trackName.strip() if request.trackName else None
-
-    if not ((artist_name and track_name) or video_id):
-        raise HTTPException(400, "artistName and trackName or videoId is required")
+    """
+    Fetch lyrics for a song by videoId.
+    
+    Request body:
+    {
+        "videoId": "xxxxxxxxx"
+    }
+    
+    Response:
+    {
+        "lyrics": "...",
+        "source": "YouTube Music"
+    }
+    """
+    video_id = request.videoId
+    
+    if not video_id:
+        raise HTTPException(400, "videoId is required")
     
     try:
-        if artist_name and track_name:
-            lrclib_data = await fetch_lrclib_lyrics(artist_name, track_name)
-            if lrclib_data:
-                return {
-                    "syncedLyrics": lrclib_data.get("syncedLyrics"),
-                    "source": "lrclib",
-                    "returner": "lrclib"
-                }
-
-        if not video_id and artist_name and track_name:
-            search_query = f"{track_name} {artist_name}"
-            search_results = await asyncio.to_thread(
-                ytmusic.search,
-                search_query,
-                filter="songs",
-                limit=1
-            )
-
-            if search_results:
-                video_id = search_results[0].get("videoId")
-
-        if not video_id:
-            raise HTTPException(404, "Lyrics not found")
-
         # Get watch playlist which contains lyrics info
         watch_data = await asyncio.to_thread(
             ytmusic.get_watch_playlist,
@@ -1453,8 +1410,7 @@ async def get_lyrics(request: LyricsRequest):
         
         return {
             "lyrics": lyrics_data["lyrics"],
-            "source": lyrics_data.get("source", "YouTube Music"),
-            "returner": "ytmusic"
+            "source": lyrics_data.get("source", "YouTube Music")
         }
         
     except HTTPException:

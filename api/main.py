@@ -82,7 +82,7 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
         print("WARNING: No cookies.txt found — bot detection likely")
 
     opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[height<=480]/best",
+        "format": "best",
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": format_ext,
@@ -92,31 +92,12 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
         "outtmpl": os.path.join(tmpdir, "%(id)s"),
         "quiet": False,
         "no_warnings": False,
-        "socket_timeout": 30,
+        "socket_timeout": 60,
         "ffmpeg_location": bin_dir,
         "keepvideo": False,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-                "Mobile/15E148 Safari/604.1"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-        "concurrent_fragment_downloads": 4,
         "fragment_retries": 10,
-        "file_access_retries": 15,
         "retries": 10,
-        "skip_unavailable_fragments": True,
         "nocheckcertificate": True,
-        "geo_bypass": True,
-        "geo_bypass_country": "US",
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios", "android", "web"],
-            }
-        },
     }
 
     if cookies_file:

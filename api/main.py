@@ -62,13 +62,12 @@ def get_quality_settings(quality: int) -> dict:
 
 
 def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int) -> dict:
-    """
-    yt-dlp options tuned to avoid YouTube bot detection on Render.
-    Uses iOS client first (least fingerprinted), with android + web as fallback.
-    Cookies file is loaded if present — place cookies.txt in project root.
-    """
     quality_settings = get_quality_settings(quality)
-    cookies_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cookies.txt")
+
+    # Check both Render secret file path and local project root
+    cookies_file = "/etc/secrets/cookies.txt"
+    if not os.path.exists(cookies_file):
+        cookies_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cookies.txt")
 
     opts = {
         "format": "bestaudio/best",
@@ -91,7 +90,6 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
                 "Mobile/15E148 Safari/604.1"
             ),
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
         "concurrent_fragment_downloads": 4,
         "fragment_retries": 10,
@@ -103,7 +101,7 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
         "geo_bypass_country": "US",
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios", "android", "web"],
+                "player_client": ["tv_embedded", "ios", "android"],
                 "player_skip": ["webpage", "configs"],
             }
         },
@@ -111,6 +109,9 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
 
     if os.path.exists(cookies_file):
         opts["cookiefile"] = cookies_file
+        print(f"Using cookies from: {cookies_file}")
+    else:
+        print("WARNING: No cookies.txt found — bot detection likely")
 
     return opts
 

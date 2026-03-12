@@ -62,13 +62,24 @@ def get_quality_settings(quality: int) -> dict:
 
 
 def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int) -> dict:
-    """
-    yt-dlp options tuned to avoid YouTube bot detection on Render.
-    Uses iOS client first (least fingerprinted), with android + web as fallback.
-    Cookies file is loaded if present — place cookies.txt in project root.
-    """
     quality_settings = get_quality_settings(quality)
-    cookies_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cookies.txt")
+
+    cookies_file = None
+    for candidate in [
+        "/etc/secrets/cookies.txt",
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "cookies.txt"),
+    ]:
+        if os.path.exists(candidate):
+            writable_cookies = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+            if not os.path.exists(writable_cookies):
+                import shutil
+                shutil.copy2(candidate, writable_cookies)
+            cookies_file = writable_cookies
+            print(f"Using cookies from: {candidate} (copied to {writable_cookies})")
+            break
+
+    if not cookies_file:
+        print("WARNING: No cookies.txt found — bot detection likely")
 
     opts = {
         "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[height<=480]/best",
@@ -109,7 +120,7 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
         },
     }
 
-    if os.path.exists(cookies_file):
+    if cookies_file:
         opts["cookiefile"] = cookies_file
 
     return opts

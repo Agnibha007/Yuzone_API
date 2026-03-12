@@ -114,8 +114,7 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
         "geo_bypass_country": "US",
         "extractor_args": {
             "youtube": {
-                "player_client": ["tv_embedded", "ios", "android", "web"],
-                "player_skip": ["webpage", "configs"],
+                "player_client": ["ios", "android", "web"],
             }
         },
     }

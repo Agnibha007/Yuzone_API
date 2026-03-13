@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, RedirectResponse
 from pydantic import BaseModel
@@ -25,7 +26,46 @@ if os.path.exists(env_file):
                 key, value = line.split("=", 1)
                 os.environ[key.strip()] = value.strip()
 
-app = FastAPI()
+WRITABLE_COOKIES = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+COOKIES_SOURCES = [
+    "/etc/secrets/cookies.txt",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.txt"),
+]
+
+
+def refresh_cookies() -> bool:
+    import shutil
+    for candidate in COOKIES_SOURCES:
+        if os.path.exists(candidate):
+            try:
+                shutil.copy2(candidate, WRITABLE_COOKIES)
+                print(f"[cookies] Refreshed from {candidate}")
+                return True
+            except Exception as e:
+                print(f"[cookies] Failed to copy from {candidate}: {e}")
+    print("[cookies] WARNING: No cookies.txt found")
+    return False
+
+
+async def cookie_refresh_loop():
+    while True:
+        refresh_cookies()
+        await asyncio.sleep(600)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    refresh_cookies()
+    task = asyncio.create_task(cookie_refresh_loop())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(lifespan=lifespan)
 ytmusic = YTMusic()
 
 spotify_token_cache = {
@@ -64,46 +104,70 @@ def get_quality_settings(quality: int) -> dict:
 def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int) -> dict:
     quality_settings = get_quality_settings(quality)
 
-    cookies_file = None
-    for candidate in [
-        "/etc/secrets/cookies.txt",
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), "cookies.txt"),
-    ]:
-        if os.path.exists(candidate):
-            writable_cookies = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-            if not os.path.exists(writable_cookies):
-                import shutil
-                shutil.copy2(candidate, writable_cookies)
-            cookies_file = writable_cookies
-            print(f"Using cookies from: {candidate} (copied to {writable_cookies})")
-            break
-
-    if not cookies_file:
-        print("WARNING: No cookies.txt found — bot detection likely")
+    refresh_cookies()
 
     opts = {
-        "format": "best",
+        "format": "bestaudio/best",
+        "quiet": False,
+        "no_warnings": False,
+        "socket_timeout": 60,
+        "ffmpeg_location": bin_dir,
+        "nocheckcertificate": True,
+    }
+
+    if os.path.exists(WRITABLE_COOKIES):
+        opts["cookiefile"] = WRITABLE_COOKIES
+
+    return opts
+
+
+async def extract_and_download(video_id: str, tmpdir: str, bin_dir: str, format_ext: str, quality: int) -> tuple[str, str]:
+    """
+    Simple yt-dlp full download — mirrors the CLI approach that works.
+    Returns (file_path, title).
+    """
+    from yt_dlp import YoutubeDL
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    quality_settings = get_quality_settings(quality)
+
+    # Use bin/ ffmpeg if it exists (Render), otherwise fall back to system ffmpeg
+    ffmpeg_dir = bin_dir if os.path.exists(os.path.join(bin_dir, "ffmpeg")) else None
+
+    opts = {
+        "format": "bestaudio/best",
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": format_ext,
             "preferredquality": quality_settings["bitrate"],
             "nopostoverwrites": False,
         }],
-        "outtmpl": os.path.join(tmpdir, "%(id)s"),
+        "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
         "quiet": False,
         "no_warnings": False,
         "socket_timeout": 60,
-        "ffmpeg_location": bin_dir,
-        "keepvideo": False,
-        "fragment_retries": 10,
-        "retries": 10,
         "nocheckcertificate": True,
     }
 
-    if cookies_file:
-        opts["cookiefile"] = cookies_file
+    if ffmpeg_dir:
+        opts["ffmpeg_location"] = ffmpeg_dir
 
-    return opts
+    if os.path.exists(WRITABLE_COOKIES):
+        opts["cookiefile"] = WRITABLE_COOKIES
+
+    def do_download():
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return info.get("title", video_id)
+
+    loop = asyncio.get_event_loop()
+    title = await loop.run_in_executor(None, do_download)
+
+    files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
+    if not files:
+        raise HTTPException(500, "yt-dlp produced no output file")
+
+    return os.path.join(tmpdir, files[0]), title
 
 
 @app.get("/")
@@ -187,43 +251,12 @@ async def download(data: DownloadIn):
             )
 
         tmpdir = tempfile.mkdtemp(prefix="dl_")
-        url = f"https://www.youtube.com/watch?v={video_id}"
+        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin")
 
         try:
-            from yt_dlp import YoutubeDL
+            file_path, title = await extract_and_download(video_id, tmpdir, bin_dir, format_ext, quality)
 
-            bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin")
-            ydl_opts = get_yt_dlp_options(tmpdir, bin_dir, format_ext, quality)
-
-            def download_sync():
-                with YoutubeDL(ydl_opts) as ydl:
-                    try:
-                        info = ydl.extract_info(url, download=True)
-                        return info.get("title", video_id)
-                    except Exception as e:
-                        error_msg = str(e)
-                        if "Sign in" in error_msg or "bot" in error_msg.lower():
-                            raise HTTPException(
-                                403,
-                                "YouTube bot detection triggered. Add a valid cookies.txt to the project root."
-                            )
-                        elif "403" in error_msg:
-                            raise HTTPException(403, "YouTube returned 403. Cookies may be expired.")
-                        elif "429" in error_msg:
-                            raise HTTPException(429, "Rate limited by YouTube. Please wait before retrying.")
-                        else:
-                            raise HTTPException(500, f"yt-dlp extraction failed: {error_msg}")
-
-            loop = asyncio.get_event_loop()
-            title = await loop.run_in_executor(None, download_sync)
-
-            files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
-
-            if not files:
-                raise HTTPException(500, "Audio file not created after postprocessing")
-
-            file_path = os.path.join(tmpdir, files[0])
-            filename = f"{title}.{format_ext}" if title else files[0]
+            filename = f"{title}.{format_ext}" if title else f"{video_id}.{format_ext}"
             filename = "".join(c for c in filename if ord(c) < 128 or c in " -_.")
 
             try:
@@ -244,8 +277,8 @@ async def download(data: DownloadIn):
                             yield chunk
                 finally:
                     try:
-                        os.remove(file_path)
-                        os.rmdir(tmpdir)
+                        import shutil
+                        shutil.rmtree(tmpdir)
                     except Exception:
                         pass
 
@@ -1235,21 +1268,19 @@ async def download_playlist(data: PlaylistDownloadIn):
     try:
         downloaded_count = 0
         failed_videos = []
+        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin")
 
         for idx, video_id in enumerate(video_ids, 1):
             try:
                 cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
 
                 if os.path.exists(cached_file):
-                    tmpdir_info = tempfile.mkdtemp(prefix="info_")
-                    url = f"https://www.youtube.com/watch?v={video_id}"
+                    # Cached — just get the title via yt-dlp info (no download)
                     title = video_id
-
                     try:
                         from yt_dlp import YoutubeDL
-                        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin")
-                        ydl_opts = get_yt_dlp_options(tmpdir_info, bin_dir, format_ext, quality)
-                        ydl_opts["skip_download"] = True
+                        url = f"https://www.youtube.com/watch?v={video_id}"
+                        ydl_opts = get_yt_dlp_options(tempfile.mkdtemp(prefix="info_"), bin_dir, format_ext, quality)
 
                         def get_title():
                             with YoutubeDL(ydl_opts) as ydl:
@@ -1263,11 +1294,6 @@ async def download_playlist(data: PlaylistDownloadIn):
                         title = await loop.run_in_executor(None, get_title)
                     except Exception:
                         title = video_id
-                    finally:
-                        try:
-                            shutil.rmtree(tmpdir_info)
-                        except Exception:
-                            pass
 
                     safe_title = "".join(c for c in title if ord(c) < 128 or c in " -_.")
                     dest_path = os.path.join(playlist_tmpdir, f"{idx:03d}_{safe_title}.{format_ext}")
@@ -1275,43 +1301,25 @@ async def download_playlist(data: PlaylistDownloadIn):
                     downloaded_count += 1
 
                 else:
+                    # Not cached — use extract_and_download
                     tmpdir = tempfile.mkdtemp(prefix="dl_")
-                    url = f"https://www.youtube.com/watch?v={video_id}"
-
                     try:
-                        from yt_dlp import YoutubeDL
-                        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin")
-                        ydl_opts = get_yt_dlp_options(tmpdir, bin_dir, format_ext, quality)
+                        file_path, title = await extract_and_download(video_id, tmpdir, bin_dir, format_ext, quality)
 
-                        def download_sync():
-                            with YoutubeDL(ydl_opts) as ydl:
-                                try:
-                                    info = ydl.extract_info(url, download=True)
-                                    return info.get("title", video_id)
-                                except Exception as e:
-                                    error_msg = str(e)
-                                    if "403" in error_msg or "429" in error_msg or "bot" in error_msg.lower():
-                                        return None
-                                    raise Exception(f"yt-dlp extraction failed: {error_msg}")
+                        safe_title = "".join(c for c in title if ord(c) < 128 or c in " -_.")
+                        dest_path = os.path.join(playlist_tmpdir, f"{idx:03d}_{safe_title}.{format_ext}")
+                        shutil.copy2(file_path, dest_path)
 
-                        loop = asyncio.get_event_loop()
-                        title = await loop.run_in_executor(None, download_sync)
+                        # Cache for future requests
+                        try:
+                            shutil.copy2(file_path, os.path.join(CACHE_DIR, f"{video_id}.{format_ext}"))
+                        except Exception:
+                            pass
 
-                        if title is None:
-                            failed_videos.append(video_id)
-                            continue
-
-                        files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
-                        if files:
-                            file_path = os.path.join(tmpdir, files[0])
-                            safe_title = "".join(c for c in title if ord(c) < 128 or c in " -_.")
-                            dest_path = os.path.join(playlist_tmpdir, f"{idx:03d}_{safe_title}.{format_ext}")
-                            shutil.copy2(file_path, dest_path)
-                            try:
-                                shutil.copy2(file_path, os.path.join(CACHE_DIR, f"{video_id}.{format_ext}"))
-                            except Exception:
-                                pass
-                            downloaded_count += 1
+                        downloaded_count += 1
+                    except Exception as e:
+                        print(f"extract_and_download failed for {video_id}: {e}")
+                        failed_videos.append(video_id)
                     finally:
                         try:
                             shutil.rmtree(tmpdir)

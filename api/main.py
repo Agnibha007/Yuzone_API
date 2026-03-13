@@ -1374,3 +1374,15 @@ async def download_playlist(data: PlaylistDownloadIn):
         except Exception:
             pass
         raise HTTPException(500, f"Playlist download failed: {str(e)}")
+@app.get("/debug/cookies")
+def debug_cookies():
+    import os
+    return {
+        "writable_exists": os.path.exists(WRITABLE_COOKIES),
+        "writable_path": WRITABLE_COOKIES,
+        "writable_size": os.path.getsize(WRITABLE_COOKIES) if os.path.exists(WRITABLE_COOKIES) else 0,
+        "sources": {
+            s: {"exists": os.path.exists(s), "size": os.path.getsize(s) if os.path.exists(s) else 0}
+            for s in COOKIES_SOURCES
+        }
+    }

@@ -60,3 +60,16 @@ Deploying to Render
 - Top charts: `/top` returns the current top 10 songs in India (rank, title, singer, cover art, videoId).
 - Search: `/search?q=` returns title, artists, duration, thumbnail, videoId.
 - Download: `/download` accepts `{ "videoId": "...", "format": "mp3" }` (use a videoId from `/search` or `/top`). This avoids YouTube search-triggered bot detection. If you hit bot prompts, add exported cookies to [cookies.txt](cookies.txt) (Render will read it automatically during build). The file must be in "Netscape HTTP Cookie File" format (the default when exporting via the yt-dlp FAQ instructions); otherwise cookies are ignored.
+
+Deploying to Netlify
+
+- This repo now includes [netlify.toml](netlify.toml) and [netlify/functions/app.py](netlify/functions/app.py).
+- The FastAPI app is wrapped with Mangum so Netlify can run it as a serverless function.
+- In Netlify dashboard, connect this repository and deploy with default settings.
+- If you want to pin Python version, set environment variable `PYTHON_VERSION=3.11` in Netlify site settings.
+
+Important serverless constraints
+
+- Netlify Functions have execution time and memory limits, so long-running audio downloads may fail on free tiers.
+- File writes are temporary in serverless environments; cache files in `downloads/` are not persistent across invocations.
+- If you need guaranteed long audio processing, Render or a container VM is still the recommended target.

@@ -53,23 +53,13 @@ Notes
 
 Deploying to Render
 
-- This repo includes [render.yaml](render.yaml) so you can click "New +" → "Blueprint" in the Render dashboard and point to this repository.
-- Build installs ffmpeg (`apt-get install -y ffmpeg`) and the Python deps, and starts with `uvicorn api.main:app --host 0.0.0.0 --port $PORT`.
-- Make sure the repo is public or connect your Git provider so Render can pull it; auto-deploy is enabled in the blueprint.
-- Health check: the root endpoint `/` returns `{"status": "local downloader running"}` once the service is up.
-- Top charts: `/top` returns the current top 10 songs in India (rank, title, singer, cover art, videoId).
-- Search: `/search?q=` returns title, artists, duration, thumbnail, videoId.
-- Download: `/download` accepts `{ "videoId": "...", "format": "mp3" }` (use a videoId from `/search` or `/top`). This avoids YouTube search-triggered bot detection. If you hit bot prompts, add exported cookies to [cookies.txt](cookies.txt) (Render will read it automatically during build). The file must be in "Netscape HTTP Cookie File" format (the default when exporting via the yt-dlp FAQ instructions); otherwise cookies are ignored.
-
-Deploying to Netlify
-
-- This repo now includes [netlify.toml](netlify.toml) and [netlify/functions/app.py](netlify/functions/app.py).
-- The FastAPI app is wrapped with Mangum so Netlify can run it as a serverless function.
-- In Netlify dashboard, connect this repository and deploy with default settings.
-- If you want to pin Python version, set environment variable `PYTHON_VERSION=3.11` in Netlify site settings.
-
-Important serverless constraints
-
-- Netlify Functions have execution time and memory limits, so long-running audio downloads may fail on free tiers.
-- File writes are temporary in serverless environments; cache files in `downloads/` are not persistent across invocations.
-- If you need guaranteed long audio processing, Render or a container VM is still the recommended target.
+- This repo includes [render.yaml](render.yaml) so you can click "New +" → "Blueprint" in the Render dashboard and point it at this repository.
+- Render installs ffmpeg during the build, installs the Python dependencies, and starts the API with `uvicorn api.main:app --host 0.0.0.0 --port $PORT --proxy-headers`.
+- The blueprint uses `/health` for health checks, so Render can verify the service without relying on a redirect.
+- Set any required environment variables in the Render dashboard before the first deploy, including `RAPIDAPI_KEY`, `GITHUB_WEBHOOK_SECRET`, and any Spotify credentials you use.
+- The root endpoint `/` redirects to `/top`.
+- `GET /health` returns `{"status": "ok"}`.
+- `GET /top` returns the current top 10 songs in India.
+- `GET /search?q=` returns title, artists, duration, thumbnail, and videoId.
+- `POST /download` and `POST /download/direct` accept a `videoId` and return MP3 audio.
+- If YouTube blocks requests, add exported cookies to [cookies.txt](cookies.txt) in Netscape HTTP Cookie File format; Render will pick them up during build.

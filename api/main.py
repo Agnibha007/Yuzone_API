@@ -253,6 +253,11 @@ def root():
     return RedirectResponse(url="/top")
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.post("/webhook/deploy")
 async def github_webhook(request: Request):
     """

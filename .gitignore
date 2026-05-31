@@ -1,5 +1,6 @@
 .vercel
 app.yaml
-Dockerfile
 wasmer.toml
 API_USAGE.md
+services/youtubei-service/node_modules/
+services/youtubei-service/dist/

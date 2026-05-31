@@ -253,6 +253,17 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
     return opts
 
 
+def _is_cookie_or_bot_block_error(error_message: str) -> bool:
+    normalized = error_message.lower()
+    return (
+        'sign in to confirm' in normalized
+        or 'cookies are no longer valid' in normalized
+        or 'not a bot' in normalized
+        or '403' in normalized
+        or '429' in normalized
+    )
+
+
 
 @app.get("/")
 def root():
@@ -355,22 +366,26 @@ async def download(data: DownloadIn):
                         info = ydl.extract_info(url, download=True)
                         return info.get('title', video_id)
                     except Exception as e:
-                        error_msg = str(e)
-                        if '403' in error_msg:
-                            raise HTTPException(403, f"YouTube blocked the request (403). Try using the /download/direct endpoint or ensure cookies are set up.")
-                        elif '429' in error_msg:
-                            raise HTTPException(429, f"Rate limited by YouTube. Please wait before trying again.")
-                        else:
-                            raise HTTPException(500, f"yt-dlp extraction failed: {error_msg}")
+                        raise RuntimeError(str(e))
             
             loop = asyncio.get_event_loop()
-            title = await loop.run_in_executor(None, download_sync)
+            try:
+                title = await loop.run_in_executor(None, download_sync)
+            except Exception as e:
+                error_msg = str(e)
+                if '429' in error_msg:
+                    raise HTTPException(429, "Rate limited by YouTube. Please wait before trying again.")
+
+                if _is_cookie_or_bot_block_error(error_msg):
+                    return await download_direct(data)
+
+                raise HTTPException(500, f"yt-dlp extraction failed: {error_msg}")
             
             # Find downloaded file
             files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
             
             if not files:
-                raise HTTPException(500, "Audio file not created after postprocessing")
+                return await download_direct(data)
             
             file_path = os.path.join(tmpdir, files[0])
             filename = f"{title}.{format_ext}" if title else files[0]
@@ -405,6 +420,8 @@ async def download(data: DownloadIn):
         except HTTPException:
             raise
         except Exception as e:
+            if _is_cookie_or_bot_block_error(str(e)):
+                return await download_direct(data)
             raise HTTPException(500, f"Download failed: {str(e)}")
 
 

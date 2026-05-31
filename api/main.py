@@ -10,6 +10,8 @@ import asyncio
 import json
 import random
 import uuid
+import time
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 import httpx
@@ -41,6 +43,15 @@ DOWNLOAD_MAX_RETRIES = int(os.getenv("DOWNLOAD_MAX_RETRIES", "4"))
 DOWNLOAD_BACKOFF_BASE_SECONDS = float(os.getenv("DOWNLOAD_BACKOFF_BASE_SECONDS", "1.5"))
 DOWNLOAD_BACKOFF_MAX_SECONDS = float(os.getenv("DOWNLOAD_BACKOFF_MAX_SECONDS", "45"))
 DOWNLOAD_JOB_TTL_SECONDS = int(os.getenv("DOWNLOAD_JOB_TTL_SECONDS", "3600"))
+DOWNLOAD_PROVIDER_TIMEOUT_SECONDS = int(os.getenv("DOWNLOAD_PROVIDER_TIMEOUT_SECONDS", "120"))
+DOWNLOAD_UPSTREAM_CONCURRENCY = int(os.getenv("DOWNLOAD_UPSTREAM_CONCURRENCY", "2"))
+DOWNLOAD_SYNC_WAIT_SECONDS = int(os.getenv("DOWNLOAD_SYNC_WAIT_SECONDS", "25"))
+DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS", "60"))
+DOWNLOAD_RATE_LIMIT_MAX_REQUESTS = int(os.getenv("DOWNLOAD_RATE_LIMIT_MAX_REQUESTS", "30"))
+
+logger = logging.getLogger("yuzone.download")
+if not logger.handlers:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
 def refresh_cookies() -> bool:
@@ -191,6 +202,10 @@ download_queue: asyncio.Queue = asyncio.Queue(maxsize=max(10, DOWNLOAD_QUEUE_MAX
 download_jobs: Dict[str, Dict[str, Any]] = {}
 download_jobs_by_key: Dict[str, str] = {}
 download_jobs_lock = asyncio.Lock()
+download_upstream_semaphore = asyncio.Semaphore(max(1, DOWNLOAD_UPSTREAM_CONCURRENCY))
+
+request_rate_limit: Dict[str, List[float]] = {}
+request_rate_limit_lock = asyncio.Lock()
 
 download_metrics: Dict[str, Any] = {
     "queued_total": 0,
@@ -207,6 +222,8 @@ download_metrics: Dict[str, Any] = {
         "yt-dlp": 0,
         "pytube": 0,
     },
+    "rate_limited_total": 0,
+    "queue_rejected_total": 0,
 }
 
 
@@ -243,15 +260,19 @@ def get_quality_settings(quality: int) -> dict:
     return quality_map[quality]
 
 
-def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int) -> dict:
+def get_yt_dlp_options(
+    tmpdir: str,
+    bin_dir: str,
+    format_ext: str,
+    quality: int,
+    player_clients: Optional[List[str]] = None,
+    use_cookies: bool = False,
+) -> dict:
     """
     Generate optimized yt-dlp options to handle 403 errors and bot detection.
     """
     quality_settings = get_quality_settings(quality)
-    cookies_candidates = [
-        WRITABLE_COOKIES,
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cookies.txt'),
-    ]
+    player_clients = player_clients or ['web']
     
     opts = {
         # More flexible format selection - tries audio-only first, then combined formats
@@ -263,11 +284,14 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
             'nopostoverwrites': False,
         }],
         'outtmpl': os.path.join(tmpdir, '%(id)s'),
-        'quiet': False,
-        'no_warnings': False,
+        'quiet': True,
+        'no_warnings': True,
         'socket_timeout': 30,
         'ffmpeg_location': bin_dir,
         'keepvideo': False,
+        'noplaylist': True,
+        'cachedir': False,
+        'ignoreerrors': False,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -285,26 +309,35 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
         'skip_unavailable_fragments': True,
         'nocheckcertificate': True,
         'prefer_insecure': False,
-        'allow_unplayable_formats': True,
         'geo_bypass': True,
         'geo_bypass_country': 'US',
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web', 'mweb'],
+                'player_client': player_clients,
                 'lang': ['en'],
-                'skip': ['dash', 'hls'],
             }
         },
     }
     
     # Add cookies if available - critical for reducing 403 errors.
     # Prefer the refreshed temp copy so deployments can use mounted secrets.
-    for cookies_file in cookies_candidates:
-        if os.path.exists(cookies_file):
+    if use_cookies:
+        cookies_file = _resolve_cookiefile()
+        if cookies_file:
             opts['cookiefile'] = cookies_file
-            break
     
     return opts
+
+
+def _resolve_cookiefile() -> Optional[str]:
+    cookies_candidates = [
+        WRITABLE_COOKIES,
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cookies.txt'),
+    ]
+    for cookies_file in cookies_candidates:
+        if os.path.exists(cookies_file):
+            return cookies_file
+    return None
 
 
 def _is_cookie_or_bot_block_error(error_message: str) -> bool:
@@ -330,6 +363,33 @@ def _calculate_backoff_seconds(attempt: int) -> float:
     base = DOWNLOAD_BACKOFF_BASE_SECONDS * (2 ** max(0, attempt - 1))
     capped = min(base, DOWNLOAD_BACKOFF_MAX_SECONDS)
     return capped + random.uniform(0.0, min(1.0, capped * 0.2))
+
+
+def _client_ip(request: Optional[Request]) -> str:
+    if request is None:
+        return "unknown"
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+async def _enforce_download_rate_limit(client_ip: str):
+    now = time.monotonic()
+    cutoff = now - DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS
+
+    async with request_rate_limit_lock:
+        events = request_rate_limit.setdefault(client_ip, [])
+        events[:] = [event for event in events if event >= cutoff]
+
+        if len(events) >= DOWNLOAD_RATE_LIMIT_MAX_REQUESTS:
+            async with download_jobs_lock:
+                download_metrics["rate_limited_total"] += 1
+            raise HTTPException(429, "Too many download requests from this client. Please retry shortly.")
+
+        events.append(now)
 
 
 def _sanitize_filename(raw_name: str, default_name: str) -> str:
@@ -442,36 +502,63 @@ async def _download_via_rapidapi(video_id: str, quality: int) -> str:
 
 
 async def _download_via_yt_dlp(video_id: str, quality: int) -> str:
-    tmpdir = tempfile.mkdtemp(prefix="ytdlp_dl_")
     cache_path = os.path.join(CACHE_DIR, f"{video_id}.mp3")
     url = f"https://www.youtube.com/watch?v={video_id}"
+    strategy_profiles = [
+        ("primary-web", ["web"], False),
+        ("android-client", ["android"], False),
+        ("alt-web-clients", ["mweb", "ios", "web"], False),
+        ("cookie-web", ["web", "mweb"], True),
+    ]
 
-    try:
-        def sync_download() -> tuple:
-            from yt_dlp import YoutubeDL
+    last_error = "yt-dlp failed"
 
-            opts = get_yt_dlp_options(tmpdir, BIN_DIR, "mp3", quality)
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                title = info.get("title", video_id)
-
-            files = [f for f in os.listdir(tmpdir) if f.endswith(".mp3")]
-            if not files:
-                raise RuntimeError("yt-dlp did not produce MP3 output")
-
-            return os.path.join(tmpdir, files[0]), title
-
-        produced_file, title = await asyncio.to_thread(sync_download)
-        import shutil
-        shutil.copy2(produced_file, cache_path)
-        update_manifest(video_id, "mp3")
-        return title
-    finally:
+    for profile_name, clients, use_cookies in strategy_profiles:
+        tmpdir = tempfile.mkdtemp(prefix=f"ytdlp_{profile_name}_")
         try:
+            def sync_download() -> tuple:
+                from yt_dlp import YoutubeDL
+
+                opts = get_yt_dlp_options(
+                    tmpdir,
+                    BIN_DIR,
+                    "mp3",
+                    quality,
+                    player_clients=clients,
+                    use_cookies=use_cookies,
+                )
+
+                with YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    title = info.get("title", video_id)
+
+                files = [f for f in os.listdir(tmpdir) if f.endswith(".mp3")]
+                if not files:
+                    raise RuntimeError("yt-dlp did not produce MP3 output")
+
+                return os.path.join(tmpdir, files[0]), title
+
+            produced_file, title = await asyncio.wait_for(
+                asyncio.to_thread(sync_download),
+                timeout=DOWNLOAD_PROVIDER_TIMEOUT_SECONDS,
+            )
+
             import shutil
-            shutil.rmtree(tmpdir)
-        except Exception:
-            pass
+            shutil.copy2(produced_file, cache_path)
+            update_manifest(video_id, "mp3")
+            logger.info("yt-dlp profile succeeded", extra={"profile": profile_name, "video_id": video_id})
+            return title
+        except Exception as profile_error:
+            last_error = f"{profile_name}: {profile_error}"
+            logger.warning("yt-dlp profile failed", extra={"profile": profile_name, "video_id": video_id, "error": str(profile_error)[:200]})
+        finally:
+            try:
+                import shutil
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    raise RuntimeError(last_error)
 
 
 async def _download_via_pytube(video_id: str, quality: int) -> str:
@@ -546,8 +633,8 @@ async def process_download_job(job_id: str):
             return
 
         providers = [
-            ("rapidapi", _download_via_rapidapi),
             ("yt-dlp", _download_via_yt_dlp),
+            ("rapidapi", _download_via_rapidapi),
             ("pytube", _download_via_pytube),
         ]
 
@@ -563,7 +650,11 @@ async def process_download_job(job_id: str):
                     job["providersTried"].append(provider_name)
 
                 try:
-                    title = await provider(video_id, quality)
+                    async with download_upstream_semaphore:
+                        title = await asyncio.wait_for(
+                            provider(video_id, quality),
+                            timeout=DOWNLOAD_PROVIDER_TIMEOUT_SECONDS,
+                        )
                     async with download_jobs_lock:
                         download_metrics["provider_success"][provider_name] += 1
                     await _finalize_job_success(job, title)
@@ -591,7 +682,7 @@ async def download_worker(worker_name: str):
         try:
             await process_download_job(job_id)
         except Exception as worker_error:
-            print(f"[{worker_name}] job {job_id} failed unexpectedly: {worker_error}")
+            logger.exception("worker failure", extra={"worker": worker_name, "job_id": job_id, "error": str(worker_error)[:200]})
         finally:
             download_queue.task_done()
 
@@ -653,6 +744,7 @@ async def enqueue_download_job(video_id: str, quality: int) -> Dict[str, Any]:
                 return existing_job
 
         if download_queue.full():
+            download_metrics["queue_rejected_total"] += 1
             raise HTTPException(503, "Download queue is full. Please retry shortly.")
 
         job_id = uuid.uuid4().hex
@@ -778,12 +870,14 @@ async def github_webhook(request: Request):
 
 
 @app.post("/download")
-async def download(data: DownloadIn):
+async def download(data: DownloadIn, request: Request):
     video_id = data.videoId
     quality = data.quality if hasattr(data, "quality") else 2
 
     if quality not in [1, 2, 3]:
         raise HTTPException(400, "Quality must be 1 (low), 2 (medium), or 3 (high)")
+
+    await _enforce_download_rate_limit(_client_ip(request))
 
     job = await enqueue_download_job(video_id, quality)
     download_url = f"/download/file/{job['jobId']}"
@@ -859,7 +953,7 @@ async def download_file(job_id: str):
 
 
 @app.post("/download/direct")
-async def download_direct(data: DownloadIn, sync: bool = False):
+async def download_direct(data: DownloadIn, request: Request, sync: bool = False):
     """
     Direct download using multiple fallback methods.
     Optimized for both localhost and Render deployment.
@@ -871,267 +965,48 @@ async def download_direct(data: DownloadIn, sync: bool = False):
     Output format is always MP3.
     """
     if not sync:
-        return await download(data)
+        return await download(data, request)
 
-    video_id = data.videoId
-    format_ext = "mp3"  # Always MP3 format
-    quality = data.quality if hasattr(data, 'quality') else 2
-    
-    # Validate quality
+    await _enforce_download_rate_limit(_client_ip(request))
+
+    quality = data.quality if hasattr(data, "quality") else 2
     if quality not in [1, 2, 3]:
         raise HTTPException(400, "Quality must be 1 (low), 2 (medium), or 3 (high)")
-    
-    # Check cache first
-    cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
-    if os.path.exists(cached_file):
-        return build_file_response(cached_file, f"{video_id}.{format_ext}", "audio/mpeg")
 
-    # Try Method 0: RapidAPI (preferred, handles bot-detection)
-    rapidapi_key = os.getenv("RAPIDAPI_KEY")
-    rapidapi_host = "youtube-media-downloader.p.rapidapi.com"
-    if rapidapi_key:
-        try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.get(
-                    f"https://{rapidapi_host}/v2/video/streams",
-                    params={"videoId": video_id},
-                    headers={
-                        "x-rapidapi-key": rapidapi_key,
-                        "x-rapidapi-host": rapidapi_host,
-                    }
-                )
+    job = await enqueue_download_job(data.videoId, quality)
+    deadline = time.monotonic() + max(5, DOWNLOAD_SYNC_WAIT_SECONDS)
 
-                if resp.status_code == 200:
-                    data = resp.json()
-                    streams = data.get("streams") or data.get("formats") or []
+    while time.monotonic() < deadline:
+        async with download_jobs_lock:
+            current_job = download_jobs.get(job["jobId"])
 
-                    # Pick best audio-only stream
-                    audio_streams = []
-                    for s in streams:
-                        mime = (s.get("mimeType") or s.get("type") or "").lower()
-                        if "audio" in mime:
-                            audio_streams.append(s)
-
-                    if audio_streams:
-                        # sort by bitrate descending if available
-                        audio_streams.sort(key=lambda x: x.get("bitrate") or x.get("kbps") or 0, reverse=True)
-                        best = audio_streams[0]
-                        audio_url = best.get("url") or best.get("downloadUrl")
-
-                        if audio_url:
-                            tmpdir = tempfile.mkdtemp(prefix="dl_")
-                            temp_file = os.path.join(tmpdir, f"{video_id}.{format_ext}")
-
-                            async with client.stream("GET", audio_url) as dresp:
-                                dresp.raise_for_status()
-                                with open(temp_file, "wb") as f:
-                                    async for chunk in dresp.aiter_bytes(65536):
-                                        f.write(chunk)
-
-                            # Cache file
-                            try:
-                                import shutil
-                                shutil.copy2(temp_file, cached_file)
-                            except Exception:
-                                pass
-
-                            def cleanup_tmpdir():
-                                try:
-                                    import shutil
-                                    shutil.rmtree(tmpdir)
-                                except Exception:
-                                    pass
-
-                            return build_file_response(
-                                temp_file,
-                                f"{video_id}.{format_ext}",
-                                "audio/mpeg",
-                                cleanup=cleanup_tmpdir,
-                            )
-        except Exception as exc:
-            print(f"RapidAPI download failed: {exc}")
-    
-    tmpdir = tempfile.mkdtemp(prefix="dl_")
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    
-    # Try Method 1: you-get (different extraction method, may bypass blocks)
-    try:
-        def youget_download():
-            import subprocess
-            output_file = os.path.join(tmpdir, f"{video_id}")
-            
-            cmd = [
-                "you-get",
-                "-o", tmpdir,
-                "-O", video_id,
-                "--format=dash-flv720",
-                url
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            
-            # Find downloaded file
-            files = [f for f in os.listdir(tmpdir) if not f.startswith('.')]
-            if files:
-                return os.path.join(tmpdir, files[0])
-            return None
-        
-        loop = asyncio.get_event_loop()
-        downloaded_file = await loop.run_in_executor(None, youget_download)
-        
-        if downloaded_file and os.path.exists(downloaded_file):
-            # Convert to desired format using ffmpeg
-            output_file = os.path.join(tmpdir, f"output.{format_ext}")
-            
-            process = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-i", downloaded_file, "-q:a", "0", "-map", "a", 
-                output_file, "-y",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+        if not current_job:
+            break
+        if current_job["status"] == "completed":
+            return await download_file(current_job["jobId"])
+        if current_job["status"] == "failed":
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "jobId": current_job["jobId"],
+                    "status": current_job["status"],
+                    "error": current_job.get("error"),
+                    "message": "Download failed after retries",
+                },
             )
-            await process.communicate()
-            
-            if os.path.exists(output_file):
-                # Cache it
-                try:
-                    import shutil
-                    shutil.copy2(output_file, cached_file)
-                except:
-                    pass
-                
-                filename = f"{video_id}.{format_ext}"
-                
-                def cleanup_tmpdir():
-                    try:
-                        import shutil
-                        shutil.rmtree(tmpdir)
-                    except Exception:
-                        pass
 
-                return build_file_response(
-                    output_file,
-                    filename,
-                    "audio/mpeg",
-                    cleanup=cleanup_tmpdir,
-                )
-    except Exception as e:
-        print(f"you-get failed: {e}")
-    
-    # Try Method 2: pytube (often works better than yt-dlp on cloud)
-    try:
-        def pytube_download():
-            from pytube import YouTube
-            yt = YouTube(url)
-            stream = yt.streams.filter(only_audio=True, file_extension='mp4').order_by('abr').desc().first()
-            
-            if stream:
-                downloaded_file = stream.download(output_path=tmpdir, filename="audio.mp4")
-                return downloaded_file, yt.title
-            return None, None
-        
-        loop = asyncio.get_event_loop()
-        downloaded_file, title = await loop.run_in_executor(None, pytube_download)
-        
-        if downloaded_file and os.path.exists(downloaded_file):
-            # Convert to desired format using ffmpeg
-            output_file = os.path.join(tmpdir, f"output.{format_ext}")
-            
-            process = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-i", downloaded_file, "-q:a", "0", "-map", "a", 
-                output_file, "-y",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            await process.communicate()
-            
-            if os.path.exists(output_file):
-                # Cache it
-                try:
-                    import shutil
-                    shutil.copy2(output_file, cached_file)
-                except:
-                    pass
-                
-                filename = f"{title}.{format_ext}" if title else f"{video_id}.{format_ext}"
-                filename = "".join(c for c in filename if ord(c) < 128 or c in ' -_.')
-                
-                def cleanup_tmpdir():
-                    try:
-                        import shutil
-                        shutil.rmtree(tmpdir)
-                    except Exception:
-                        pass
+        await asyncio.sleep(0.5)
 
-                return build_file_response(
-                    output_file,
-                    filename,
-                    "audio/mpeg",
-                    cleanup=cleanup_tmpdir,
-                )
-    except Exception as e:
-        print(f"pytube failed: {e}")
-    
-    # Try Method 3: yt-dlp with latest best practices
-    try:
-        from yt_dlp import YoutubeDL
-        
-        # Get ffmpeg location from bundled bin/ directory
-        bin_dir = BIN_DIR
-        
-        # Get optimized yt-dlp options
-        ydl_opts = get_yt_dlp_options(tmpdir, bin_dir, format_ext, quality)
-        
-        def download_sync():
-            with YoutubeDL(ydl_opts) as ydl:
-                try:
-                    info = ydl.extract_info(url, download=True)
-                    return info.get('title', video_id)
-                except Exception as e:
-                    raise HTTPException(500, f"yt-dlp extraction failed: {str(e)}")
-        
-        loop = asyncio.get_event_loop()
-        title = await loop.run_in_executor(None, download_sync)
-        
-        files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
-        
-        if files:
-            file_path = os.path.join(tmpdir, files[0])
-            filename = f"{title}.{format_ext}" if title else files[0]
-            filename = "".join(c for c in filename if ord(c) < 128 or c in ' -_.')
-            
-            # Cache
-            try:
-                import shutil
-                shutil.copy2(file_path, cached_file)
-            except Exception:
-                pass
-            
-            def cleanup_tmpdir():
-                try:
-                    import shutil
-                    shutil.rmtree(tmpdir)
-                except Exception:
-                    pass
-
-            return build_file_response(
-                file_path,
-                filename,
-                "audio/mpeg",
-                cleanup=cleanup_tmpdir,
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"yt-dlp failed: {e}")
-    
-    # Cleanup temp dir if all methods failed
-    try:
-        import shutil
-        shutil.rmtree(tmpdir)
-    except:
-        pass
-    
-    raise HTTPException(503, "Download failed. This service requires pre-cached files on Render. Please contact admin to cache this song.")
+    return JSONResponse(
+        status_code=202,
+        content={
+            "jobId": job["jobId"],
+            "status": "queued",
+            "statusUrl": f"/download/jobs/{job['jobId']}",
+            "downloadUrl": f"/download/file/{job['jobId']}",
+            "message": "Download still processing",
+        },
+    )
 
 
 async def convert_audio(input_file, output_format, tmpdir):

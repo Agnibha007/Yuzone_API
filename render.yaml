@@ -26,3 +26,13 @@ services:
         value: 45
       - key: DOWNLOAD_JOB_TTL_SECONDS
         value: 3600
+      - key: DOWNLOAD_PROVIDER_TIMEOUT_SECONDS
+        value: 120
+      - key: DOWNLOAD_UPSTREAM_CONCURRENCY
+        value: 2
+      - key: DOWNLOAD_SYNC_WAIT_SECONDS
+        value: 25
+      - key: DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS
+        value: 60
+      - key: DOWNLOAD_RATE_LIMIT_MAX_REQUESTS
+        value: 30

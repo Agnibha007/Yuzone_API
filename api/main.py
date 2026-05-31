@@ -194,7 +194,10 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
     Generate optimized yt-dlp options to handle 403 errors and bot detection.
     """
     quality_settings = get_quality_settings(quality)
-    cookies_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cookies.txt')
+    cookies_candidates = [
+        WRITABLE_COOKIES,
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cookies.txt'),
+    ]
     
     opts = {
         # More flexible format selection - tries audio-only first, then combined formats
@@ -240,9 +243,12 @@ def get_yt_dlp_options(tmpdir: str, bin_dir: str, format_ext: str, quality: int)
         },
     }
     
-    # Add cookies if available - critical for reducing 403 errors
-    if os.path.exists(cookies_file):
-        opts['cookiefile'] = cookies_file
+    # Add cookies if available - critical for reducing 403 errors.
+    # Prefer the refreshed temp copy so deployments can use mounted secrets.
+    for cookies_file in cookies_candidates:
+        if os.path.exists(cookies_file):
+            opts['cookiefile'] = cookies_file
+            break
     
     return opts
 

@@ -61,5 +61,7 @@ Deploying to Render
 - `GET /health` returns `{"status": "ok"}`.
 - `GET /top` returns the current top 10 songs in India.
 - `GET /search?q=` returns title, artists, duration, thumbnail, and videoId.
-- `POST /download` and `POST /download/direct` accept a `videoId` and return MP3 audio.
+- `POST /download` and `POST /download/direct` accept a `videoId` and queue asynchronous MP3 download jobs.
+- `GET /download/jobs/{jobId}` returns job status and `GET /download/file/{jobId}` returns the MP3 when ready.
+- `GET /health/download` and `GET /metrics/download` expose queue/worker health and provider metrics.
 - If YouTube blocks requests, add exported cookies to [cookies.txt](cookies.txt) in Netscape HTTP Cookie File format; Render will pick them up during build.

@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, RedirectResponse, Response
+from fastapi.responses import StreamingResponse, RedirectResponse, Response, JSONResponse
 from pydantic import BaseModel
 from ytmusicapi import YTMusic
 import subprocess
@@ -8,6 +8,8 @@ import os
 import tempfile
 import asyncio
 import json
+import random
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 import httpx
@@ -15,7 +17,7 @@ import hmac
 import hashlib
 import base64
 from urllib.parse import urlparse, parse_qs
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict, Any, List
 
 # Load .local.env if it exists
 env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".local.env")
@@ -32,6 +34,13 @@ COOKIES_SOURCES = [
     "/etc/secrets/cookies.txt",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.txt"),
 ]
+
+DOWNLOAD_WORKER_COUNT = int(os.getenv("DOWNLOAD_WORKER_COUNT", "2"))
+DOWNLOAD_QUEUE_MAXSIZE = int(os.getenv("DOWNLOAD_QUEUE_MAXSIZE", "200"))
+DOWNLOAD_MAX_RETRIES = int(os.getenv("DOWNLOAD_MAX_RETRIES", "4"))
+DOWNLOAD_BACKOFF_BASE_SECONDS = float(os.getenv("DOWNLOAD_BACKOFF_BASE_SECONDS", "1.5"))
+DOWNLOAD_BACKOFF_MAX_SECONDS = float(os.getenv("DOWNLOAD_BACKOFF_MAX_SECONDS", "45"))
+DOWNLOAD_JOB_TTL_SECONDS = int(os.getenv("DOWNLOAD_JOB_TTL_SECONDS", "3600"))
 
 
 def refresh_cookies() -> bool:
@@ -58,13 +67,36 @@ async def cookie_refresh_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     refresh_cookies()
-    task = asyncio.create_task(cookie_refresh_loop())
+    cookie_task = asyncio.create_task(cookie_refresh_loop())
+    gc_task = asyncio.create_task(download_job_gc_loop())
+
+    worker_tasks = [
+        asyncio.create_task(download_worker(f"dl-worker-{idx+1}"))
+        for idx in range(max(1, DOWNLOAD_WORKER_COUNT))
+    ]
+
     yield
-    task.cancel()
+
+    cookie_task.cancel()
+    gc_task.cancel()
+    for task in worker_tasks:
+        task.cancel()
+
     try:
-        await task
+        await cookie_task
     except asyncio.CancelledError:
         pass
+
+    try:
+        await gc_task
+    except asyncio.CancelledError:
+        pass
+
+    for task in worker_tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def prepare_binary_paths() -> str:
@@ -154,6 +186,28 @@ download_semaphore = asyncio.Semaphore(5)
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "downloads")
 os.makedirs(CACHE_DIR, exist_ok=True)
 CACHE_MANIFEST = os.path.join(CACHE_DIR, "manifest.json")
+
+download_queue: asyncio.Queue = asyncio.Queue(maxsize=max(10, DOWNLOAD_QUEUE_MAXSIZE))
+download_jobs: Dict[str, Dict[str, Any]] = {}
+download_jobs_by_key: Dict[str, str] = {}
+download_jobs_lock = asyncio.Lock()
+
+download_metrics: Dict[str, Any] = {
+    "queued_total": 0,
+    "completed_total": 0,
+    "failed_total": 0,
+    "in_progress": 0,
+    "provider_attempts": {
+        "rapidapi": 0,
+        "yt-dlp": 0,
+        "pytube": 0,
+    },
+    "provider_success": {
+        "rapidapi": 0,
+        "yt-dlp": 0,
+        "pytube": 0,
+    },
+}
 
 
 class DownloadIn(BaseModel):
@@ -264,6 +318,368 @@ def _is_cookie_or_bot_block_error(error_message: str) -> bool:
     )
 
 
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _download_job_key(video_id: str, quality: int) -> str:
+    return f"{video_id}:{quality}:mp3"
+
+
+def _calculate_backoff_seconds(attempt: int) -> float:
+    base = DOWNLOAD_BACKOFF_BASE_SECONDS * (2 ** max(0, attempt - 1))
+    capped = min(base, DOWNLOAD_BACKOFF_MAX_SECONDS)
+    return capped + random.uniform(0.0, min(1.0, capped * 0.2))
+
+
+def _sanitize_filename(raw_name: str, default_name: str) -> str:
+    safe = "".join(c for c in (raw_name or "") if ord(c) < 128 or c in " -_.")
+    safe = safe.strip() or default_name
+    if not safe.lower().endswith(".mp3"):
+        safe = f"{safe}.mp3"
+    return safe
+
+
+async def _mark_job_failed(job: Dict[str, Any], error_message: str):
+    async with download_jobs_lock:
+        job["status"] = "failed"
+        job["error"] = error_message[:400]
+        job["updatedAt"] = _utc_now_iso()
+        download_metrics["failed_total"] += 1
+
+
+async def _finalize_job_success(job: Dict[str, Any], title: str):
+    video_id = job["videoId"]
+    cache_path = os.path.join(CACHE_DIR, f"{video_id}.mp3")
+    filename = _sanitize_filename(title, f"{video_id}.mp3")
+
+    async with download_jobs_lock:
+        job["status"] = "completed"
+        job["error"] = None
+        job["cachePath"] = cache_path
+        job["filename"] = filename
+        job["updatedAt"] = _utc_now_iso()
+        download_metrics["completed_total"] += 1
+
+
+async def _download_via_rapidapi(video_id: str, quality: int) -> str:
+    rapidapi_key = os.getenv("RAPIDAPI_KEY")
+    if not rapidapi_key:
+        raise RuntimeError("RAPIDAPI_KEY not configured")
+
+    rapidapi_host = "youtube-media-downloader.p.rapidapi.com"
+    quality_settings = get_quality_settings(quality)
+    tmpdir = tempfile.mkdtemp(prefix="rapidapi_dl_")
+    raw_file = os.path.join(tmpdir, f"{video_id}.raw")
+    output_file = os.path.join(tmpdir, f"{video_id}.mp3")
+    cache_path = os.path.join(CACHE_DIR, f"{video_id}.mp3")
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(
+                f"https://{rapidapi_host}/v2/video/streams",
+                params={"videoId": video_id},
+                headers={
+                    "x-rapidapi-key": rapidapi_key,
+                    "x-rapidapi-host": rapidapi_host,
+                },
+            )
+
+            if resp.status_code != 200:
+                raise RuntimeError(f"RapidAPI stream lookup failed with {resp.status_code}")
+
+            payload = resp.json()
+            streams = payload.get("streams") or payload.get("formats") or []
+            audio_streams = []
+            for stream in streams:
+                mime = (stream.get("mimeType") or stream.get("type") or "").lower()
+                if "audio" in mime:
+                    audio_streams.append(stream)
+
+            if not audio_streams:
+                raise RuntimeError("RapidAPI did not return an audio stream")
+
+            audio_streams.sort(key=lambda x: x.get("bitrate") or x.get("kbps") or 0, reverse=True)
+            audio_url = audio_streams[0].get("url") or audio_streams[0].get("downloadUrl")
+            if not audio_url:
+                raise RuntimeError("RapidAPI audio stream missing URL")
+
+            async with client.stream("GET", audio_url) as dresp:
+                dresp.raise_for_status()
+                with open(raw_file, "wb") as out:
+                    async for chunk in dresp.aiter_bytes(65536):
+                        out.write(chunk)
+
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            raw_file,
+            "-vn",
+            "-acodec",
+            "libmp3lame",
+            "-b:a",
+            quality_settings["bitrate"],
+            output_file,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await process.communicate()
+        if process.returncode != 0 or not os.path.exists(output_file):
+            raise RuntimeError("RapidAPI audio conversion failed")
+
+        import shutil
+        shutil.copy2(output_file, cache_path)
+        update_manifest(video_id, "mp3")
+
+        return video_id
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+
+
+async def _download_via_yt_dlp(video_id: str, quality: int) -> str:
+    tmpdir = tempfile.mkdtemp(prefix="ytdlp_dl_")
+    cache_path = os.path.join(CACHE_DIR, f"{video_id}.mp3")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    try:
+        def sync_download() -> tuple:
+            from yt_dlp import YoutubeDL
+
+            opts = get_yt_dlp_options(tmpdir, BIN_DIR, "mp3", quality)
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = info.get("title", video_id)
+
+            files = [f for f in os.listdir(tmpdir) if f.endswith(".mp3")]
+            if not files:
+                raise RuntimeError("yt-dlp did not produce MP3 output")
+
+            return os.path.join(tmpdir, files[0]), title
+
+        produced_file, title = await asyncio.to_thread(sync_download)
+        import shutil
+        shutil.copy2(produced_file, cache_path)
+        update_manifest(video_id, "mp3")
+        return title
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+
+
+async def _download_via_pytube(video_id: str, quality: int) -> str:
+    tmpdir = tempfile.mkdtemp(prefix="pytube_dl_")
+    source_file = os.path.join(tmpdir, "audio.mp4")
+    output_file = os.path.join(tmpdir, "audio.mp3")
+    cache_path = os.path.join(CACHE_DIR, f"{video_id}.mp3")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    quality_settings = get_quality_settings(quality)
+
+    try:
+        def sync_download() -> str:
+            from pytube import YouTube
+
+            yt = YouTube(url)
+            stream = yt.streams.filter(only_audio=True, file_extension="mp4").order_by("abr").desc().first()
+            if not stream:
+                raise RuntimeError("pytube did not find an audio stream")
+            stream.download(output_path=tmpdir, filename="audio")
+            return yt.title or video_id
+
+        title = await asyncio.to_thread(sync_download)
+
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            source_file,
+            "-vn",
+            "-acodec",
+            "libmp3lame",
+            "-b:a",
+            quality_settings["bitrate"],
+            output_file,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await process.communicate()
+        if process.returncode != 0 or not os.path.exists(output_file):
+            raise RuntimeError("pytube conversion to mp3 failed")
+
+        import shutil
+        shutil.copy2(output_file, cache_path)
+        update_manifest(video_id, "mp3")
+        return title
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+
+
+async def process_download_job(job_id: str):
+    async with download_jobs_lock:
+        job = download_jobs.get(job_id)
+        if not job:
+            return
+        if job["status"] in {"completed", "failed", "running"}:
+            return
+        job["status"] = "running"
+        job["updatedAt"] = _utc_now_iso()
+        download_metrics["in_progress"] += 1
+
+    video_id = job["videoId"]
+    quality = job["quality"]
+    cache_path = os.path.join(CACHE_DIR, f"{video_id}.mp3")
+
+    try:
+        if os.path.exists(cache_path):
+            await _finalize_job_success(job, video_id)
+            return
+
+        providers = [
+            ("rapidapi", _download_via_rapidapi),
+            ("yt-dlp", _download_via_yt_dlp),
+            ("pytube", _download_via_pytube),
+        ]
+
+        last_error = "download failed"
+        for attempt in range(1, DOWNLOAD_MAX_RETRIES + 1):
+            async with download_jobs_lock:
+                job["attempt"] = attempt
+                job["updatedAt"] = _utc_now_iso()
+
+            for provider_name, provider in providers:
+                async with download_jobs_lock:
+                    download_metrics["provider_attempts"][provider_name] += 1
+                    job["providersTried"].append(provider_name)
+
+                try:
+                    title = await provider(video_id, quality)
+                    async with download_jobs_lock:
+                        download_metrics["provider_success"][provider_name] += 1
+                    await _finalize_job_success(job, title)
+                    return
+                except Exception as provider_error:
+                    last_error = f"{provider_name}: {provider_error}"
+
+            if attempt < DOWNLOAD_MAX_RETRIES:
+                backoff = _calculate_backoff_seconds(attempt)
+                async with download_jobs_lock:
+                    job["nextRetryInSeconds"] = round(backoff, 2)
+                    job["lastError"] = last_error[:400]
+                    job["updatedAt"] = _utc_now_iso()
+                await asyncio.sleep(backoff)
+
+        await _mark_job_failed(job, last_error)
+    finally:
+        async with download_jobs_lock:
+            download_metrics["in_progress"] = max(0, download_metrics["in_progress"] - 1)
+
+
+async def download_worker(worker_name: str):
+    while True:
+        job_id = await download_queue.get()
+        try:
+            await process_download_job(job_id)
+        except Exception as worker_error:
+            print(f"[{worker_name}] job {job_id} failed unexpectedly: {worker_error}")
+        finally:
+            download_queue.task_done()
+
+
+async def download_job_gc_loop():
+    while True:
+        await asyncio.sleep(300)
+        cutoff = datetime.utcnow().timestamp() - DOWNLOAD_JOB_TTL_SECONDS
+
+        async with download_jobs_lock:
+            removable = []
+            for job_id, job in download_jobs.items():
+                if job["status"] not in {"completed", "failed"}:
+                    continue
+                try:
+                    updated_ts = datetime.fromisoformat(job["updatedAt"].replace("Z", "")).timestamp()
+                except Exception:
+                    updated_ts = 0
+                if updated_ts < cutoff:
+                    removable.append((job_id, _download_job_key(job["videoId"], job["quality"])))
+
+            for job_id, key in removable:
+                download_jobs.pop(job_id, None)
+                if download_jobs_by_key.get(key) == job_id:
+                    download_jobs_by_key.pop(key, None)
+
+
+async def enqueue_download_job(video_id: str, quality: int) -> Dict[str, Any]:
+    key = _download_job_key(video_id, quality)
+    now_iso = _utc_now_iso()
+
+    cached_file = os.path.join(CACHE_DIR, f"{video_id}.mp3")
+    if os.path.exists(cached_file):
+        job_id = uuid.uuid4().hex
+        ready_job = {
+            "jobId": job_id,
+            "videoId": video_id,
+            "quality": quality,
+            "status": "completed",
+            "attempt": 0,
+            "createdAt": now_iso,
+            "updatedAt": now_iso,
+            "cachePath": cached_file,
+            "filename": f"{video_id}.mp3",
+            "providersTried": [],
+            "lastError": None,
+            "nextRetryInSeconds": 0,
+            "error": None,
+        }
+        async with download_jobs_lock:
+            download_jobs[job_id] = ready_job
+        return ready_job
+
+    async with download_jobs_lock:
+        existing_job_id = download_jobs_by_key.get(key)
+        if existing_job_id and existing_job_id in download_jobs:
+            existing_job = download_jobs[existing_job_id]
+            if existing_job["status"] in {"queued", "running", "completed"}:
+                return existing_job
+
+        if download_queue.full():
+            raise HTTPException(503, "Download queue is full. Please retry shortly.")
+
+        job_id = uuid.uuid4().hex
+        job = {
+            "jobId": job_id,
+            "videoId": video_id,
+            "quality": quality,
+            "status": "queued",
+            "attempt": 0,
+            "createdAt": now_iso,
+            "updatedAt": now_iso,
+            "cachePath": None,
+            "filename": f"{video_id}.mp3",
+            "providersTried": [],
+            "lastError": None,
+            "nextRetryInSeconds": 0,
+            "error": None,
+        }
+
+        download_jobs[job_id] = job
+        download_jobs_by_key[key] = job_id
+        download_metrics["queued_total"] += 1
+
+    await download_queue.put(job_id)
+    return job
+
+
 
 @app.get("/")
 def root():
@@ -273,6 +689,37 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/health/download")
+async def health_download():
+    async with download_jobs_lock:
+        queued = sum(1 for job in download_jobs.values() if job["status"] == "queued")
+        running = sum(1 for job in download_jobs.values() if job["status"] == "running")
+        completed = sum(1 for job in download_jobs.values() if job["status"] == "completed")
+        failed = sum(1 for job in download_jobs.values() if job["status"] == "failed")
+        return {
+            "status": "ok",
+            "queueSize": download_queue.qsize(),
+            "workers": max(1, DOWNLOAD_WORKER_COUNT),
+            "jobs": {
+                "queued": queued,
+                "running": running,
+                "completed": completed,
+                "failed": failed,
+            },
+            "metrics": download_metrics,
+        }
+
+
+@app.get("/metrics/download")
+async def download_metrics_endpoint():
+    async with download_jobs_lock:
+        return {
+            "queueSize": download_queue.qsize(),
+            "workerCount": max(1, DOWNLOAD_WORKER_COUNT),
+            "metrics": download_metrics,
+        }
 
 
 @app.post("/webhook/deploy")
@@ -332,101 +779,87 @@ async def github_webhook(request: Request):
 
 @app.post("/download")
 async def download(data: DownloadIn):
-    async with download_semaphore:
-        video_id = data.videoId
-        format_ext = "mp3"  # Always MP3 format
-        quality = data.quality if hasattr(data, 'quality') else 2
-        
-        # Validate quality
-        if quality not in [1, 2, 3]:
-            raise HTTPException(400, "Quality must be 1 (low), 2 (medium), or 3 (high)")
-        
-        # Check cache first
-        cached_file = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
-        if os.path.exists(cached_file):
-            filename = f"{video_id}.{format_ext}"
-            return build_file_response(cached_file, filename, "audio/mpeg")
-        
-        # Perform direct download on server (works on localhost)
-        tmpdir = tempfile.mkdtemp(prefix="dl_")
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        
-        try:
-            from yt_dlp import YoutubeDL
-            
-            # Get ffmpeg location from bundled bin/ directory
-            bin_dir = BIN_DIR
-            
-            # Get optimized yt-dlp options
-            ydl_opts = get_yt_dlp_options(tmpdir, bin_dir, format_ext, quality)
-            
-            def download_sync():
-                with YoutubeDL(ydl_opts) as ydl:
-                    try:
-                        info = ydl.extract_info(url, download=True)
-                        return info.get('title', video_id)
-                    except Exception as e:
-                        raise RuntimeError(str(e))
-            
-            loop = asyncio.get_event_loop()
-            try:
-                title = await loop.run_in_executor(None, download_sync)
-            except Exception as e:
-                error_msg = str(e)
-                if '429' in error_msg:
-                    raise HTTPException(429, "Rate limited by YouTube. Please wait before trying again.")
+    video_id = data.videoId
+    quality = data.quality if hasattr(data, "quality") else 2
 
-                if _is_cookie_or_bot_block_error(error_msg):
-                    return await download_direct(data)
+    if quality not in [1, 2, 3]:
+        raise HTTPException(400, "Quality must be 1 (low), 2 (medium), or 3 (high)")
 
-                raise HTTPException(500, f"yt-dlp extraction failed: {error_msg}")
-            
-            # Find downloaded file
-            files = [f for f in os.listdir(tmpdir) if f.endswith(f".{format_ext}")]
-            
-            if not files:
-                return await download_direct(data)
-            
-            file_path = os.path.join(tmpdir, files[0])
-            filename = f"{title}.{format_ext}" if title else files[0]
-            filename = "".join(c for c in filename if ord(c) < 128 or c in ' -_.')
-            
-            # Cache the file for future requests
-            try:
-                import shutil
-                cached_path = os.path.join(CACHE_DIR, f"{video_id}.{format_ext}")
-                shutil.copy2(file_path, cached_path)
-            except Exception as cache_error:
-                # Log but don't fail if caching fails
-                pass
-            
-            def cleanup_download_artifacts():
-                try:
-                    os.remove(file_path)
-                except Exception:
-                    pass
-                try:
-                    os.rmdir(tmpdir)
-                except Exception:
-                    pass
+    job = await enqueue_download_job(video_id, quality)
+    download_url = f"/download/file/{job['jobId']}"
 
-            return build_file_response(
-                file_path,
-                filename,
-                "audio/mpeg",
-                cleanup=cleanup_download_artifacts,
-            )
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            if _is_cookie_or_bot_block_error(str(e)):
-                return await download_direct(data)
-            raise HTTPException(500, f"Download failed: {str(e)}")
+    status_code = 200 if job["status"] == "completed" else 202
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "jobId": job["jobId"],
+            "videoId": job["videoId"],
+            "quality": job["quality"],
+            "status": job["status"],
+            "attempt": job["attempt"],
+            "downloadUrl": download_url,
+            "statusUrl": f"/download/jobs/{job['jobId']}",
+            "error": job.get("error"),
+        },
+    )
+
+
+@app.get("/download/jobs/{job_id}")
+async def download_job_status(job_id: str):
+    async with download_jobs_lock:
+        job = download_jobs.get(job_id)
+
+    if not job:
+        raise HTTPException(404, "Download job not found")
+
+    payload = {
+        "jobId": job["jobId"],
+        "videoId": job["videoId"],
+        "quality": job["quality"],
+        "status": job["status"],
+        "attempt": job["attempt"],
+        "createdAt": job["createdAt"],
+        "updatedAt": job["updatedAt"],
+        "providersTried": job.get("providersTried", []),
+        "lastError": job.get("lastError"),
+        "nextRetryInSeconds": job.get("nextRetryInSeconds", 0),
+        "error": job.get("error"),
+    }
+
+    if job["status"] == "completed":
+        payload["downloadUrl"] = f"/download/file/{job_id}"
+
+    return payload
+
+
+@app.get("/download/file/{job_id}")
+async def download_file(job_id: str):
+    async with download_jobs_lock:
+        job = download_jobs.get(job_id)
+
+    if not job:
+        raise HTTPException(404, "Download job not found")
+
+    if job["status"] != "completed":
+        return JSONResponse(
+            status_code=409,
+            content={
+                "jobId": job_id,
+                "status": job["status"],
+                "error": job.get("error"),
+                "message": "Download is not ready yet",
+            },
+        )
+
+    cache_path = job.get("cachePath") or os.path.join(CACHE_DIR, f"{job['videoId']}.mp3")
+    if not os.path.exists(cache_path):
+        raise HTTPException(410, "Downloaded file expired or unavailable")
+
+    return build_file_response(cache_path, job.get("filename") or f"{job['videoId']}.mp3", "audio/mpeg")
 
 
 @app.post("/download/direct")
-async def download_direct(data: DownloadIn):
+async def download_direct(data: DownloadIn, sync: bool = False):
     """
     Direct download using multiple fallback methods.
     Optimized for both localhost and Render deployment.
@@ -437,6 +870,9 @@ async def download_direct(data: DownloadIn):
     
     Output format is always MP3.
     """
+    if not sync:
+        return await download(data)
+
     video_id = data.videoId
     format_ext = "mp3"  # Always MP3 format
     quality = data.quality if hasattr(data, 'quality') else 2

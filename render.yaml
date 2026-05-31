@@ -14,3 +14,15 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11
+      - key: DOWNLOAD_WORKER_COUNT
+        value: 2
+      - key: DOWNLOAD_QUEUE_MAXSIZE
+        value: 200
+      - key: DOWNLOAD_MAX_RETRIES
+        value: 4
+      - key: DOWNLOAD_BACKOFF_BASE_SECONDS
+        value: 1.5
+      - key: DOWNLOAD_BACKOFF_MAX_SECONDS
+        value: 45
+      - key: DOWNLOAD_JOB_TTL_SECONDS
+        value: 3600

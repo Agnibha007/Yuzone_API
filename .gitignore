@@ -1,5 +1,4 @@
 .vercel
-/downloads
 app.yaml
 Dockerfile
 wasmer.toml
